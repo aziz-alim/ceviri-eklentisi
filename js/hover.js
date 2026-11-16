@@ -21,11 +21,12 @@
   let explainDict = {};                  // Ollama'nın ürettiği Türkçe açıklamalar (kalıcı)
   let sentenceDict = {};                 // cümle -> Türkçe çevirisi (kalıcı, yan panelle ortak)
   let contextLog = {};                   // kelime -> [{s: cümle, h: site, t: zaman}] (en fazla 5/kelime)
-  let ctxDirty = false, ctxFlushTimer = null;
+  let ctxDirty = false, ctxFlushTimer = null, ctxQueue = [];
   let known = new Set(), learning = new Set();
 
   const llmCache = new Map();            // oturum içi: kelime -> çeviri | null
   const llmPending = new Set();
+  const llmFailed = new Set();           // zaman aşımı / geçersiz yanıt (Ollama açık ama çeviri gelmedi)
   let llmDown = false;                   // Ollama erişilemiyorsa spinner gösterme
   let llmDownAt = 0;                     // 60 sn sonra otomatik tekrar dene
 
@@ -250,6 +251,9 @@
     const rect = range.getBoundingClientRect();
     if (!rect || (!rect.width && !rect.height)) return null;
     range.detach();
+    // caretRangeFromPoint boşlukta en yakın metne yapışır: imleç kelimenin kutusunda değilse balon açma
+    const PAD = 2;
+    if (x < rect.left - PAD || x > rect.right + PAD || y < rect.top - PAD || y > rect.bottom + PAD) return null;
 
     // ikili kalıp (phrasal verb) — önce "prev + kelime", sonra "kelime + next"
     let phrase = null;
@@ -367,15 +371,17 @@
     if (!c.sentence || c.sentence.length < 12) return;
     const arr = contextLog[c.w] || (contextLog[c.w] = []);
     if (arr.some((x) => x.s === c.sentence)) return;       // aynı cümle tekrar sayılmaz
-    arr.unshift({ s: c.sentence.slice(0, 200), h: HOST, t: Date.now() });
+    const entry = { s: c.sentence.slice(0, 200), h: HOST, t: Date.now() };
+    arr.unshift(entry);
     if (arr.length > 5) arr.length = 5;
-    const keys = Object.keys(contextLog);
-    if (keys.length > 1500) delete contextLog[keys[0]];    // depo şişmesin
+    // kalıcı yazım background'da (tek yazma noktası); sınırlar orada uygulanır
+    ctxQueue.push({ op: "ctxAdd", w: c.w, entry });
     ctxDirty = true;
     clearTimeout(ctxFlushTimer);
     ctxFlushTimer = setTimeout(() => {
       ctxDirty = false;
-      chrome.storage.local.set({ contextLog }).catch(() => {});
+      const ops = ctxQueue; ctxQueue = [];
+      KRStore.mutate(ops);
     }, 3000);
   }
 
@@ -424,10 +430,8 @@
       known.delete(w); learning.delete(w);
       if (next === "known") known.add(w);
       if (next === "learning") learning.add(w);
-      try {
-        await chrome.storage.local.set({ knownWords: [...known], learningWords: [...learning] });
-      } catch (e) {}
       updateTipBtns();
+      await KRStore.setState(w, next);
     }));
     tip.querySelector('[data-a="retr"]').addEventListener("click", async (ev) => {
       ev.stopPropagation();
@@ -481,9 +485,10 @@
     if (!ctx) return;
     if (ctx.sel) {
       if (sentPending.has(ctx.text)) return;
-      delete sentenceDict[ctx.text];
-      for (const s of splitSentences(ctx.text)) delete sentenceDict[s];   // parça kayıtlarını da tazele
-      try { await chrome.storage.local.set({ sentenceDict }); } catch (e) {}
+      sentFailed.delete(ctx.text);
+      const keys = [ctx.text, ...splitSentences(ctx.text)];   // parça kayıtlarını da tazele
+      keys.forEach((k) => delete sentenceDict[k]);
+      await KRStore.mutate(keys.map((key) => ({ op: "dictDel", store: "sentenceDict", key })));
       llmDown = false;
       llmDownAt = 0;
       renderTip();
@@ -492,12 +497,11 @@
     const w = ctx.w;
     if (llmPending.has(w)) return;
     llmCache.delete(w);
+    llmFailed.delete(w);
     delete userDict[w];
     delete meaningsDict[w];
     delete explainDict[w];
-    try {
-      await chrome.storage.local.set({ userDict, meaningsDict, explainDict });
-    } catch (e) {}
+    await KRStore.deleteWord(w);
     llmDown = false;                    // elle yenileme: "kapalı" bayrağını yok say
     llmDownAt = 0;
     renderTip();                        // kayıt silindi → spinner + yeni istek tetiklenir
@@ -532,6 +536,7 @@
       const tr = sentenceDict[ctx.text];
       if (tr) main.textContent = tr;
       else if (llmDown) main.textContent = "(çeviri için Ollama çalışıyor olmalı)";
+      else if (sentFailed.has(ctx.text)) main.textContent = "(çeviri alınamadı — 🔄 ile tekrar dene)";
       else { main.textContent = "⏳ çevriliyor… (Ollama — local)"; requestSentence(ctx.text); }
       return;
     }
@@ -560,6 +565,8 @@
         mainTxt = base;
       } else if (llmPending.has(w)) {
         mainTxt = "⏳ çevriliyor… (Ollama — local)";
+      } else if (llmFailed.has(w)) {
+        mainTxt = "(çeviri alınamadı — 🔄 ile tekrar dene)";
       } else if (llmDown || cached === null) {
         mainTxt = "(yerleşik sözlükte yok)";
       } else {
@@ -596,6 +603,7 @@
      Paragraf seçilirse cümlelere bölünüp TEK istekte çevrilir; her cümle ayrı
      önbelleğe alınır — sonra o cümle tek başına sorulursa anında gelir. */
   const sentPending = new Set();
+  const sentFailed = new Set();          // bu oturumda çevrilemeyen seçimler (sonsuz istek döngüsü olmasın)
 
   function splitSentences(text) {
     return text.split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean);
@@ -606,13 +614,14 @@
     sentPending.add(text);
     const parts = splitSentences(text);
     const payload = parts.length > 1
-      ? { type: "krh-sentence-batch", sentences: parts }
+      ? { type: "krh-sentence-batch", sentences: parts, whole: text }
       : { type: "krh-sentence", sentence: text };
     try {
       chrome.runtime.sendMessage(payload, (resp) => {
         sentPending.delete(text);
         if (chrome.runtime.lastError || !resp || resp.down || (!resp.t && !resp.arr)) {
           if (resp && resp.down) { llmDown = true; llmDownAt = Date.now(); }
+          else sentFailed.add(text);                    // zaman aşımı / geçersiz yanıt: 🔄 ile tekrar
           if (ctx && ctx.sentence === text) renderTip();
           return;
         }
@@ -622,9 +631,7 @@
         } else if (resp.t) {
           sentenceDict[text] = resp.t;
         }
-        const keys = Object.keys(sentenceDict);
-        while (keys.length > 2000) delete sentenceDict[keys.shift()];   // en eskiler atılır
-        chrome.storage.local.set({ sentenceDict }).catch(() => {});
+        // kalıcı kayıt background'da yapıldı; burada yalnız bellekteki kopya güncel
         if (ctx && ctx.sentence === text) { renderTip(); placeTip(ctx.rect); }
       });
     } catch (e) {
@@ -672,27 +679,23 @@
         { type: "krh-translate", word, sentence, domainLabel: DOMAIN_LABELS[curDomain()] || "genel" },
         (resp) => {
           llmPending.delete(w);
-          if (chrome.runtime.lastError || !resp || !resp.t) {
+          if (chrome.runtime.lastError) return;
+          // imleç başka kelimeye geçti, istek kuyruktan düştü: önbelleğe yazma, tekrar sorulabilir
+          if (resp && resp.cancelled) return;
+          if (!resp || !resp.t) {
             llmCache.set(w, null);
             if (resp && resp.down) { llmDown = true; llmDownAt = Date.now(); }
+            else llmFailed.add(w);
             if (ctx && ctx.w === w) renderTip();
             return;
           }
           // şemalı cevap: {t: anlam, other: [diğer anlamlar], note: Türkçe açıklama}
           const entry = { t: resp.t, other: resp.other || [], note: resp.note || "" };
           llmCache.set(w, entry);
-          userDict[w] = entry.t;                     // kalıcı sözlüğe ekle (yan panel de görür)
-          if (entry.other.length) {
-            meaningsDict[w] = entry.other;           // yan panelin "diğer anlamlar"ıyla aynı depo
-            const mKeys = Object.keys(meaningsDict);
-            if (mKeys.length >= 1500) delete meaningsDict[mKeys[0]];
-          }
-          if (entry.note) {
-            explainDict[w] = entry.note;
-            const eKeys = Object.keys(explainDict);
-            if (eKeys.length >= 1500) delete explainDict[eKeys[0]];
-          }
-          chrome.storage.local.set({ userDict, meaningsDict, explainDict }).catch(() => {});
+          // kalıcı kayıt background'da yapıldı (userDict/meaningsDict/explainDict); bellekteki kopya:
+          userDict[w] = entry.t;
+          if (entry.other.length) meaningsDict[w] = entry.other;
+          if (entry.note) explainDict[w] = entry.note;
           if (ctx && ctx.w === w) { renderTip(); placeTip(ctx.rect); }
         });
     } catch (e) {

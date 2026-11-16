@@ -51,7 +51,7 @@ async function init() {
   // bugünkü çeviri sayısı
   try {
     const ds = await chrome.storage.local.get(["dailyStats"]);
-    const n = ds.dailyStats?.[new Date().toISOString().slice(0, 10)]?.translated || 0;
+    const n = ds.dailyStats?.[krDayKey()]?.translated || 0;
     $("#todayCount").textContent = n ? " · Bugün: " + n + " çeviri" : "";
   } catch (e) {}
 

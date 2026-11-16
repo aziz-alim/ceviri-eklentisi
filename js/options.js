@@ -166,7 +166,7 @@ async function deleteWord(w) {
   delete userDict[w];
   delete meaningsDict[w];
   delete explainDict[w];
-  await chrome.storage.local.set({ userDict, meaningsDict, explainDict });
+  await KRStore.deleteWord(w);   // tek yazma noktası (background)
   renderWordTable();
 }
 
@@ -202,13 +202,13 @@ async function save() {
 
 /* ---- 📊 istatistik satırı: bugün + seri + toplam ---- */
 function renderStats() {
-  const day = new Date().toISOString().slice(0, 10);
+  const day = krDayKey();
   const today = dailyStats[day]?.translated || 0;
   // seri: bugünden (veya dünden) geriye doğru arka arkaya aktif günler
   let streak = 0;
   const d = new Date();
-  if (!dailyStats[d.toISOString().slice(0, 10)]?.translated) d.setDate(d.getDate() - 1);
-  while (dailyStats[d.toISOString().slice(0, 10)]?.translated > 0) {
+  if (!dailyStats[krDayKey(d)]?.translated) d.setDate(d.getDate() - 1);
+  while (dailyStats[krDayKey(d)]?.translated > 0) {
     streak++;
     d.setDate(d.getDate() - 1);
   }
@@ -277,9 +277,8 @@ async function answerQuiz(gotIt) {
       learning.delete(w);
       known.add(w);
       delete srsData[w];
-      await chrome.storage.local.set({
-        knownWords: [...known], learningWords: [...learning], srsData
-      });
+      await KRStore.setState(w, "known");
+      await chrome.storage.local.set({ srsData });
       renderWordTable();
       renderStats();
       renderQuiz();

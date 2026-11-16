@@ -1,14 +1,15 @@
 /* Çeviri Eklentisi — service worker
    Görevleri:
-   1) Content script'in Ollama isteklerine proxy olmak (sayfa CSP'sine takılmaz)
-   2) Alt+Shift+K ile hover çeviriyi aç/kapat + ikon rozeti
-   (İkon tıklaması artık popup.html açar; yan panel oradan açılır.) */
+   1) TEK Ollama katmanı: hover, yan panel ve okuyucunun bütün LLM istekleri buradan geçer
+      (sıra + eşzamanlılık sınırı + zaman aşımı + şemalı JSON + saçma çıktı kontrolü).
+   2) TEK yazma noktası: paylaşılan sözlük/durum verisi burada sırayla yazılır (sekmeler arası yarış yok).
+   3) Alt+Shift+K ile hover çeviriyi aç/kapat + ikon rozeti. */
 
 chrome.runtime.onInstalled.addListener(async () => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
   chrome.action.setBadgeBackgroundColor({ color: "#c792ea" });
   syncBadge();
-  cleanupTranslations(false);   // şema v2'ye tek seferlik sessiz geçiş
+  withStore(() => cleanupTranslations(false));   // şema v2'ye tek seferlik sessiz geçiş
   // siteRules artık BEYAZ LİSTE (true = açık): eski kara liste kayıtlarını (false) temizle
   const st = await chrome.storage.local.get(["siteRules"]);
   if (st.siteRules) {
@@ -19,6 +20,90 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(syncBadge);
+
+/* yerel saate göre gün anahtarı (UTC değil) */
+function dayKey(d) {
+  d = d || new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+/* ================= TEK YAZMA NOKTASI =================
+   Bütün okuma-değiştirme-yazma işlemleri bu zincirde sırayla çalışır. */
+let storeChain = Promise.resolve();
+function withStore(fn) {
+  const p = storeChain.then(fn, fn);
+  storeChain = p.catch(() => {});
+  return p;
+}
+
+const DICT_STORES = ["userDict", "meaningsDict", "explainDict", "sentenceDict"];
+const DICT_CAPS = { meaningsDict: 1500, explainDict: 1500, sentenceDict: 2000 };
+const CTX_PER_WORD = 5, CTX_MAX_WORDS = 1500;
+
+/* ops: dictSet / dictDel / state / ctxAdd — bkz. js/store.js */
+function applyOps(ops) {
+  if (!Array.isArray(ops) || !ops.length) return Promise.resolve({ ok: true });
+  return withStore(async () => {
+    const need = new Set();
+    for (const o of ops) {
+      if ((o.op === "dictSet" || o.op === "dictDel") && DICT_STORES.includes(o.store)) need.add(o.store);
+      else if (o.op === "state") { need.add("knownWords"); need.add("learningWords"); }
+      else if (o.op === "ctxAdd") need.add("contextLog");
+    }
+    if (!need.size) return { ok: false };
+    const st = await chrome.storage.local.get([...need]);
+    const out = {};
+    let known = null, learning = null;
+
+    for (const o of ops) {
+      if (o.op === "dictSet" || o.op === "dictDel") {
+        if (!DICT_STORES.includes(o.store) || !o.key) continue;
+        const key = o.store === "sentenceDict" ? String(o.key) : String(o.key).toLowerCase();
+        const d = out[o.store] || (out[o.store] = st[o.store] || {});
+        if (o.op === "dictDel" || o.value == null || o.value === "" ||
+            (Array.isArray(o.value) && !o.value.length)) { delete d[key]; continue; }
+        const cap = DICT_CAPS[o.store];
+        if (cap && d[key] === undefined) {
+          const keys = Object.keys(d);
+          while (keys.length >= cap) delete d[keys.shift()];   // en eski kayıt atılır
+        }
+        d[key] = o.value;
+      } else if (o.op === "state" && o.w) {
+        if (!known) { known = new Set(st.knownWords || []); learning = new Set(st.learningWords || []); }
+        const w = String(o.w).toLowerCase();
+        known.delete(w); learning.delete(w);
+        if (o.state === "known") known.add(w);
+        if (o.state === "learning") learning.add(w);
+      } else if (o.op === "ctxAdd" && o.w && o.entry && o.entry.s) {
+        const cl = out.contextLog || (out.contextLog = st.contextLog || {});
+        const w = String(o.w).toLowerCase();
+        const arr = cl[w] || (cl[w] = []);
+        if (arr.some((x) => x.s === o.entry.s)) continue;     // aynı cümle tekrar sayılmaz
+        arr.unshift({ s: String(o.entry.s).slice(0, 200), h: o.entry.h || "", t: o.entry.t || Date.now() });
+        if (arr.length > CTX_PER_WORD) arr.length = CTX_PER_WORD;
+        const keys = Object.keys(cl);
+        while (keys.length > CTX_MAX_WORDS) delete cl[keys.shift()];
+      }
+    }
+    if (known) { out.knownWords = [...known]; out.learningWords = [...learning]; }
+    if (Object.keys(out).length) await chrome.storage.local.set(out);
+    return { ok: true };
+  });
+}
+
+/* Ollama sonucunu kalıcı depolara yaz (kelime şeması: t / other / note) */
+function saveWordResult(w, r) {
+  const ops = [{ op: "dictSet", store: "userDict", key: w, value: r.t }];
+  if (r.other && r.other.length) ops.push({ op: "dictSet", store: "meaningsDict", key: w, value: r.other });
+  if (r.note) ops.push({ op: "dictSet", store: "explainDict", key: w, value: r.note });
+  return applyOps(ops);
+}
+function saveSentences(map) {
+  const ops = Object.entries(map).filter(([s, t]) => s && t)
+    .map(([s, t]) => ({ op: "dictSet", store: "sentenceDict", key: s, value: t }));
+  return applyOps(ops);
+}
+
 
 /* ---- Çeviri deposu temizliği: her kayıt tek şemada ----
    userDict:    kelime -> kısa anlam (≤ 40 kr, tırnaksız, tek satır)
@@ -113,12 +198,12 @@ async function cleanupTranslations(force) {
   return { skipped: false, ...stats, total: keys.size };
 }
 
+
 async function syncBadge() {
   const st = await chrome.storage.local.get(["settings", "dailyStats"]);
   const enabled = !st.settings || st.settings.hoverEnabled !== false;
   if (!enabled) { chrome.action.setBadgeText({ text: "⏸" }); return; }
-  const day = new Date().toISOString().slice(0, 10);
-  const n = st.dailyStats?.[day]?.translated || 0;
+  const n = st.dailyStats?.[dayKey()]?.translated || 0;
   chrome.action.setBadgeText({ text: n ? String(n) : "" });   // bugünkü çeviri sayısı
 }
 
@@ -139,39 +224,129 @@ chrome.storage.onChanged.addListener((chg, area) => {
   if (area === "local" && chg.settings) syncBadge();
 });
 
-/* ayarlar sayfasından manuel temizlik: { type:"krh-cleanup" } */
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.type !== "krh-cleanup") return;
-  cleanupTranslations(true).then(sendResponse);
-  return true;
-});
-
-/* ---- Ollama proxy ----
-   krh-translate: { word, sentence, domainLabel } -> { t, other, note } | { down:true } | null
-   krh-sentence:  { sentence }                   -> { t } | { down:true } | null */
+/* ================= TEK OLLAMA KATMANI =================
+   - Kuyruk: aynı anda en çok MAX_PARALLEL istek; etkileşimli istekler (hover, tıklama)
+     arka plan toplu çevirilerin önüne geçer.
+   - Hover'da imleç yeni bir kelimeye geçince, aynı sekmenin henüz başlamamış eski
+     kelime istekleri kuyruktan düşer ({cancelled:true}).
+   - Zaman aşımı: AbortSignal.timeout. Zaman aşımı "Ollama kapalı" sayılmaz
+     (model ilk yüklenirken yavaş olabilir); bağlantı hatası 60 sn "kapalı" önbelleğine girer.
+   - format: JSON şeması (Ollama ≥ 0.5). Eski sürüm şemayı reddederse "json" moduna düşülür. */
+const MAX_PARALLEL = 2;
+const PRI = { interactive: 0, batch: 1 };
+const queue = [];
+let running = 0;
 let ollamaDownUntil = 0;
+let schemaUnsupported = false;
 
-async function ollamaGenerate(prompt, system) {
-  if (Date.now() < ollamaDownUntil) return { down: true };
-  try {
-    const st = await chrome.storage.local.get(["settings"]);
-    const settings = st.settings || {};
-    const url = settings.ollamaUrl || "http://localhost:11434";
-    const model = settings.model || "llama3.1";
-    const body = { model, prompt, stream: false, options: { temperature: 0.2 } };
-    if (system) body.system = system;
-    const res = await fetch(url + "/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) throw new Error("Ollama HTTP " + res.status);
-    return { raw: ((await res.json()).response || "").trim() };
-  } catch (e) {
-    ollamaDownUntil = Date.now() + 60000;   // 1 dk boyunca hızlı "kapalı" dön
-    return { down: true };
+function enqueue(task, { priority = PRI.interactive, group = null } = {}) {
+  return new Promise((resolve) => {
+    const item = { task, resolve, priority, group };
+    let i = queue.length;
+    while (i > 0 && queue[i - 1].priority > priority) i--;   // aynı öncelikte FIFO
+    queue.splice(i, 0, item);
+    pump();
+  });
+}
+function pump() {
+  while (running < MAX_PARALLEL && queue.length) {
+    const it = queue.shift();
+    running++;
+    Promise.resolve().then(it.task)
+      .then(it.resolve, () => it.resolve({ error: "beklenmeyen hata" }))
+      .finally(() => { running--; pump(); });
   }
 }
+function dropQueued(group) {
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (queue[i].group === group) { queue[i].resolve({ cancelled: true }); queue.splice(i, 1); }
+  }
+}
+
+async function getSettings() {
+  const st = await chrome.storage.local.get(["settings"]);
+  const s = st.settings || {};
+  return { url: (s.ollamaUrl || "http://localhost:11434").replace(/\/+$/, ""), model: s.model || "llama3.1" };
+}
+
+/* tek bir /api/generate çağrısı → { raw } | { down } | { timeout } | { error } | { cancelled } */
+function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, group } = {}) {
+  if (Date.now() < ollamaDownUntil) return Promise.resolve({ down: true });
+  return enqueue(async () => {
+    if (Date.now() < ollamaDownUntil) return { down: true };
+    const { url, model } = await getSettings();
+    const body = { model, prompt, stream: false, options: { temperature: 0.2 } };
+    if (system) body.system = system;
+    if (format) body.format = (schemaUnsupported && typeof format === "object") ? "json" : format;
+    try {
+      let res = await fetch(url + "/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      // eski Ollama JSON şemasını tanımıyorsa (400) bir kez "json" moduyla dene
+      if (res.status === 400 && body.format && typeof body.format === "object") {
+        schemaUnsupported = true;
+        body.format = "json";
+        res = await fetch(url + "/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeoutMs)
+        });
+      }
+      if (!res.ok) {
+        let msg = "HTTP " + res.status;
+        try { const j = await res.json(); if (j.error) msg += ": " + j.error; } catch (e) {}
+        if (res.status === 403) msg += " (OLLAMA_ORIGINS ayarı eksik olabilir)";
+        return { error: msg };
+      }
+      return { raw: ((await res.json()).response || "").trim() };
+    } catch (e) {
+      if (e && (e.name === "TimeoutError" || e.name === "AbortError")) return { timeout: true };
+      ollamaDownUntil = Date.now() + 60000;   // 1 dk boyunca hızlı "kapalı" dön
+      return { down: true };
+    }
+  }, { priority, group });
+}
+
+/* ilk geçerli JSON nesnesi/dizisi: önce tam metin, sonra metin içinden ayıklama */
+function parseJson(raw, kind) {
+  try { return JSON.parse(raw); } catch (e) {}
+  const m = raw.match(kind === "array" ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch (e) { return null; }
+}
+
+/* başarısız sonucu arayüze taşınacak forma çevir */
+function failOf(r) {
+  if (r.down) return { down: true };
+  if (r.cancelled) return { cancelled: true };
+  if (r.timeout) return { error: "zaman aşımı (model yavaş ya da yükleniyor)" };
+  return { error: r.error || "geçersiz yanıt" };
+}
+
+const strArr = (n) => ({ type: "array", items: { type: "string" }, ...(n ? { maxItems: n } : {}) });
+const SCHEMA = {
+  word: {
+    type: "object",
+    properties: { anlam: { type: "string" }, diger: strArr(3), aciklama: { type: "string" } },
+    required: ["anlam", "diger", "aciklama"]
+  },
+  sentences: { type: "object", properties: { ceviriler: strArr() }, required: ["ceviriler"] },
+  meanings: { type: "object", properties: { anlamlar: strArr(3) }, required: ["anlamlar"] },
+  wordBatch: {
+    type: "object",
+    properties: {
+      kelimeler: {
+        type: "array",
+        items: { type: "object", properties: { w: { type: "string" }, t: { type: "string" } }, required: ["w", "t"] }
+      }
+    },
+    required: ["kelimeler"]
+  }
+};
 
 /* çevirmen kimliği: modelin talimatları tekrarlamasını engeller */
 const TR_SYS =
@@ -197,114 +372,215 @@ function looksLikeMeta(t, src) {
   return false;
 }
 
+const unquote = (s) => String(s == null ? "" : s).trim().replace(/^["'“”]+|["'“”]+$/g, "").trim();
+
+/* ---- işlemler ---- */
+
 /* tek cümle çevirisi — doğrulamalı, gerekiyorsa kendi kendine tekrar dener */
-async function translateSentence(sentence, retries) {
+async function opSentence(sentence, { retries = 3, priority } = {}) {
   const prompt =
     `Aşağıdaki İngilizce cümleyi Türkçeye çevir.\n` +
     `Kurallar: TEK bir çeviri ver (teknik/doğal gibi ayrımlar yapma, alternatif sunma); ` +
     `akıcı ve doğal olsun; teknik terimleri gerekiyorsa aynen bırak; ` +
     `açıklama, not veya başlık ekleme; yalnızca çeviriyi yaz.\n\nCümle: "${sentence}"`;
-  for (let i = 0; i < (retries || 3); i++) {
-    const r = await ollamaGenerate(prompt, TR_SYS);
-    if (r.down) return { down: true };
+  for (let i = 0; i < retries; i++) {
+    const r = await ollamaGenerate(prompt, { system: TR_SYS, priority });
+    if (r.raw === undefined) return failOf(r);
     // model yine de iki satır/alternatif dönerse ilk anlamlı satırı al
-    const t = r.raw.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-    const clean = t.replace(/^["']|["']$/g, "").trim();
-    if (clean && !looksLikeMeta(clean, sentence)) return { t: clean };
+    const t = unquote(r.raw.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "");
+    if (t && !looksLikeMeta(t, sentence)) {
+      await saveSentences({ [sentence]: t });
+      return { t };
+    }
   }
-  return null;   // ısrarla saçmalıyorsa null — arayüz hata gösterir, 🔄 ile tekrar denenir
+  return { error: "model geçerli bir çeviri üretmedi" };
+}
+
+/* cümle listesi tek istekte; sıra/sayı tutmazsa null */
+async function opSentenceBatch(sentences, { priority = PRI.interactive, whole } = {}) {
+  const sents = Array.isArray(sentences) ? sentences.slice(0, 30) : [];
+  if (!sents.length) return { error: "boş liste" };
+  const prompt =
+    "Aşağıdaki İngilizce cümleleri Türkçeye çevir. Kurallar: her cümle için TEK, akıcı ve doğal bir çeviri; " +
+    "açıklama ekleme; teknik terimleri gerekiyorsa aynen bırak. Girdi cümleleriyle BİREBİR AYNI SIRADA ve " +
+    "aynı sayıda öğe içeren {\"ceviriler\": [\"çeviri1\", \"çeviri2\", ...]} JSON nesnesi döndür.\n\n" +
+    sents.map((s, i) => (i + 1) + ". \"" + s + "\"").join("\n");
+  let arr = null;
+  for (let i = 0; i < 2 && !arr; i++) {
+    const r = await ollamaGenerate(prompt, { system: TR_SYS, format: SCHEMA.sentences, timeoutMs: 120000, priority });
+    if (r.raw === undefined) return failOf(r);
+    const o = parseJson(r.raw, "object");
+    const list = Array.isArray(o) ? o : (o && Array.isArray(o.ceviriler) ? o.ceviriler : parseJson(r.raw, "array"));
+    if (Array.isArray(list) && list.length === sents.length) arr = list.map((x) => unquote(x));
+  }
+  if (!arr) return { error: "toplu çeviri sırası tutmadı" };
+  // saçma görünen öğeleri tek tek, doğrulamalı yolla tazele
+  for (let i = 0; i < arr.length; i++) {
+    if (looksLikeMeta(arr[i], sents[i])) {
+      const one = await opSentence(sents[i], { retries: 2, priority });
+      if (one.t) arr[i] = one.t;
+    }
+  }
+  const map = {};
+  sents.forEach((s, i) => { if (arr[i]) map[s] = arr[i]; });
+  if (whole) map[whole] = arr.filter(Boolean).join(" ");   // seçilen paragrafın bütünü
+  await saveSentences(map);
+  return { arr };
+}
+
+/* hover kelime analizi: anlam + diğer anlamlar + açıklama; sonuç kalıcı sözlüğe yazılır */
+async function opWord(word, sentence, domainLabel, group) {
+  const domain = domainLabel || "genel";
+  const prompt =
+    `İngilizce kelimeyi ${domain} bağlamında analiz et.\n` +
+    `Kelime: "${word}"\n` +
+    (sentence ? `Cümle: "${sentence}"\n` : "") +
+    `YALNIZCA şu JSON şemasında cevap ver:\n` +
+    `{"anlam":"kelimenin bu bağlamdaki en uygun Türkçe karşılığı (en fazla 3 kelime)",` +
+    `"diger":["varsa diğer yaygın anlam 1","diğer yaygın anlam 2"],` +
+    `"aciklama":"kelimenin bu cümledeki kullanımını açıklayan 1 cümlelik Türkçe açıklama"}\n` +
+    `Kurallar: teknik terimi gerekiyorsa aynen bırak; "diger" listesi boş olabilir ama anahtarlar hep bulunur.`;
+  const r = await ollamaGenerate(prompt, { system: TR_SYS, format: SCHEMA.word, timeoutMs: 45000, group });
+  if (r.raw === undefined) return failOf(r);
+
+  let out = null;
+  const o = parseJson(r.raw, "object");
+  if (o && o.anlam) {
+    const t = unquote(o.anlam);
+    if (t) {
+      out = {
+        t,
+        other: (Array.isArray(o.diger) ? o.diger : []).map(unquote)
+          .filter((x) => x && x.toLowerCase() !== t.toLowerCase()).slice(0, 3),
+        note: unquote(o.aciklama)
+      };
+    }
+  }
+  if (!out) {
+    const t = unquote(r.raw);
+    if (t && t.length <= 40 && !t.includes("\n")) out = { t, other: [], note: "" };   // düz metin dönerse
+  }
+  if (!out) return { error: "geçersiz yanıt" };
+  await saveWordResult(word.toLowerCase(), out);
+  bumpDaily();
+  return out;
+}
+
+/* kısa karşılık (yan paneldeki 🔄 yeniden çevir) */
+async function opWordShort(word, domainLabel) {
+  const r = await ollamaGenerate(
+    `"${word}" İngilizce kelimesini ${domainLabel || "genel"} bağlamında Türkçeye çevir. ` +
+    `Kurallar: en fazla 3 kelimelik kısa karşılık; teknik terimi gerekiyorsa aynen bırak. ` +
+    `YALNIZCA karşılığı yaz, başka hiçbir şey ekleme.`, { system: TR_SYS });
+  if (r.raw === undefined) return failOf(r);
+  const t = unquote(r.raw.split("\n").map((s) => s.trim()).filter(Boolean)[0] || "");
+  if (!t || looksLikeMeta(t, word) || t.length > 60) return { error: "geçersiz yanıt" };
+  await applyOps([{ op: "dictSet", store: "userDict", key: word, value: t }]);
+  return { t };
+}
+
+/* en yaygın 3 anlam (yan panel "diğer anlamlar") */
+async function opMeanings(word) {
+  const r = await ollamaGenerate(
+    `İngilizce "${word}" kelimesinin en yaygın 3 Türkçe anlamını, en sık kullanımdan daha nadir olana doğru ` +
+    `sıralayarak {"anlamlar":["anlam1","anlam2","anlam3"]} JSON nesnesi olarak döndür. ` +
+    `Kurallar: her anlam en fazla 4 kelime; teknik bağlam öncelikli.`, { system: TR_SYS, format: SCHEMA.meanings });
+  if (r.raw === undefined) return failOf(r);
+  const o = parseJson(r.raw, "object");
+  const list = (Array.isArray(o) ? o : (o && Array.isArray(o.anlamlar) ? o.anlamlar : []))
+    .map(unquote).filter(Boolean).slice(0, 3);
+  if (list.length) await applyOps([{ op: "dictSet", store: "meaningsDict", key: word, value: list }]);
+  return { list };
+}
+
+/* kelimenin cümledeki kullanımını açıkla (kaydedilmez) */
+async function opExplain(word, sentence, domainLabel) {
+  const r = await ollamaGenerate(
+    `Alan: ${domainLabel || "genel"}.\nİngilizce cümle: "${sentence}"\nKelime: "${word}"\n` +
+    `Bu kelimeyi bu cümledeki kullanımına göre 1-2 cümleyle Türkçe açıkla; gerekiyorsa çevirme, teknik terimi koru. Kısa ve net ol.`,
+    { system: "Sen teknik metinler için Türkçe açıklama yazan bir çeviri asistanısın. Yalnızca açıklamayı yazarsın." });
+  if (r.raw === undefined) return failOf(r);
+  return r.raw ? { t: r.raw } : { error: "boş yanıt" };
+}
+
+/* okuyucudaki toplu kelime çevirisi → [{w,t}] ve kalıcı sözlüğe yazım */
+async function opWordBatch(words, domainLabel) {
+  const list = (Array.isArray(words) ? words : []).slice(0, 40);
+  if (!list.length) return { items: [] };
+  const r = await ollamaGenerate(
+    "Aşağıdaki İngilizce kelimeleri " + (domainLabel || "genel") +
+    " bağlamında Türkçeye çevir. Kurallar: her kelime için en fazla 3 kelimelik kısa karşılık; " +
+    "teknik terimi gerekiyorsa aynen bırak. YALNIZCA {\"kelimeler\":[{\"w\":\"kelime\",\"t\":\"karşılık\"},...]} JSON nesnesi döndür.\n\n" +
+    "Kelimeler: " + list.join(", "),
+    { system: TR_SYS, format: SCHEMA.wordBatch, timeoutMs: 120000, priority: PRI.batch });
+  if (r.raw === undefined) return failOf(r);
+  const o = parseJson(r.raw, "object");
+  const arr = Array.isArray(o) ? o : (o && Array.isArray(o.kelimeler) ? o.kelimeler : []);
+  const want = new Set(list.map((w) => w.toLowerCase()));
+  const items = arr
+    .map((it) => ({ w: unquote(it && it.w).toLowerCase(), t: unquote(it && it.t) }))
+    .filter((it) => it.w && it.t && it.t.length <= 60 && want.has(it.w));
+  await applyOps(items.map((it) => ({ op: "dictSet", store: "userDict", key: it.w, value: it.t })));
+  return { items };
+}
+
+async function opPing(timeoutMs) {
+  const { url } = await getSettings();
+  try {
+    const r = await fetch(url + "/api/tags", { signal: AbortSignal.timeout(timeoutMs || 2500) });
+    if (r.ok) ollamaDownUntil = 0;
+    return { ok: r.ok };
+  } catch (e) { return { ok: false }; }
 }
 
 /* ---- günlük istatistik + rozet sayacı ----
-   dailyStats: { "2026-10-19": { translated: 12 } } — 90 gün saklanır */
-async function bumpDaily() {
-  const day = new Date().toISOString().slice(0, 10);
-  const st = await chrome.storage.local.get(["dailyStats"]);
-  const ds = st.dailyStats || {};
-  ds[day] = ds[day] || { translated: 0 };
-  ds[day].translated++;
-  const days = Object.keys(ds).sort();
-  while (days.length > 90) delete ds[days.shift()];      // eski günleri budala
-  await chrome.storage.local.set({ dailyStats: ds });
-  const s2 = await chrome.storage.local.get(["settings"]);
-  const hoverOn = !s2.settings || s2.settings.hoverEnabled !== false;
-  chrome.action.setBadgeText({ text: hoverOn ? String(ds[day].translated) : "⏸" });
+   dailyStats: { "2026-10-19": { translated: 12 } } — 90 gün saklanır, gün anahtarı yerel saat */
+function bumpDaily() {
+  return withStore(async () => {
+    const day = dayKey();
+    const st = await chrome.storage.local.get(["dailyStats", "settings"]);
+    const ds = st.dailyStats || {};
+    ds[day] = ds[day] || { translated: 0 };
+    ds[day].translated++;
+    const days = Object.keys(ds).sort();
+    while (days.length > 90) delete ds[days.shift()];      // eski günleri buda
+    await chrome.storage.local.set({ dailyStats: ds });
+    const hoverOn = !st.settings || st.settings.hoverEnabled !== false;
+    chrome.action.setBadgeText({ text: hoverOn ? String(ds[day].translated) : "⏸" });
+  });
 }
 
+/* ---- mesaj yönlendirici ----
+   krh-translate:      { word, sentence, domainLabel } -> { t, other, note } | { down } | { cancelled } | { error }
+   krh-sentence:       { sentence }                    -> { t } | ...
+   krh-sentence-batch: { sentences, whole?, batch? }   -> { arr } | ...
+   krh-ollama:         { op: ping|wordShort|meanings|explain|wordBatch, ... }
+   krh-mutate:         { ops }                         -> { ok }
+   krh-cleanup:        {}                              -> temizlik istatistiği */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || (msg.type !== "krh-translate" && msg.type !== "krh-sentence" && msg.type !== "krh-sentence-batch")) return;
+  if (!msg || typeof msg.type !== "string" || !msg.type.startsWith("krh-")) return;
+  const tabGroup = "hover:" + (sender.tab ? sender.tab.id : "x") + ":" + (sender.frameId || 0);
   (async () => {
-    if (msg.type === "krh-sentence") {
-      return await translateSentence(msg.sentence, 3);
-    }
-    if (msg.type === "krh-sentence-batch") {
-      const sents = Array.isArray(msg.sentences) ? msg.sentences.slice(0, 30) : [];
-      if (!sents.length) return null;
-      const prompt =
-        "Aşağıdaki İngilizce cümleleri Türkçeye çevir. Kurallar: her cümle için TEK, akıcı ve doğal bir çeviri; " +
-        "açıklama ekleme; teknik terimleri gerekiyorsa aynen bırak. Girdi cümleleriyle BİREBİR AYNI SIRADA ve " +
-        "aynı sayıda öğe içeren bir JSON dizisi döndür: [\"çeviri1\", \"çeviri2\", ...]\n\n" +
-        sents.map((s, i) => (i + 1) + ". \"" + s + "\"").join("\n");
-      let arr = null;
-      for (let i = 0; i < 2 && !arr; i++) {
-        const r = await ollamaGenerate(prompt, TR_SYS);
-        if (r.down) return { down: true };
-        const m = r.raw.match(/\[[\s\S]*\]/);
-        if (!m) continue;
-        try {
-          const parsed = JSON.parse(m[0]);
-          // sıra/sayı birebir tutmalı, aksi halde kaymış demektir — tekrar dene
-          if (Array.isArray(parsed) && parsed.length === sents.length) {
-            arr = parsed.map((x) => String(x).trim());
-          }
-        } catch (e) { /* tekrar dene */ }
-      }
-      if (!arr) return null;   // toplu çeviri tutmadı — arayüz bütün metni tek parça çevirir
-      // saçma görünen öğeleri tek tek, doğrulamalı yolla tazele
-      for (let i = 0; i < arr.length; i++) {
-        if (looksLikeMeta(arr[i], sents[i])) {
-          const one = await translateSentence(sents[i], 2);
-          arr[i] = one && one.t ? one.t : arr[i];
+    switch (msg.type) {
+      case "krh-mutate": return applyOps(msg.ops);
+      case "krh-cleanup": return withStore(() => cleanupTranslations(true));
+      case "krh-translate":
+        dropQueued(tabGroup);   // imleç yeni kelimede: aynı sekmenin bekleyen eski istekleri düşer
+        return opWord(String(msg.word || ""), msg.sentence, msg.domainLabel, tabGroup);
+      case "krh-sentence": return opSentence(String(msg.sentence || ""));
+      case "krh-sentence-batch":
+        return opSentenceBatch(msg.sentences, { whole: msg.whole, priority: msg.batch ? PRI.batch : PRI.interactive });
+      case "krh-ollama":
+        switch (msg.op) {
+          case "ping": return opPing(msg.timeoutMs);
+          case "wordShort": return opWordShort(String(msg.word || ""), msg.domainLabel);
+          case "meanings": return opMeanings(String(msg.word || ""));
+          case "explain": return opExplain(String(msg.word || ""), String(msg.sentence || ""), msg.domainLabel);
+          case "wordBatch": return opWordBatch(msg.words, msg.domainLabel);
         }
-      }
-      return { arr };
+        return { error: "bilinmeyen işlem" };
     }
-    const domain = msg.domainLabel || "genel";
-    const prompt =
-      `İngilizce kelimeyi ${domain} bağlamında analiz et.\n` +
-      `Kelime: "${msg.word}"\n` +
-      (msg.sentence ? `Cümle: "${msg.sentence}"\n` : "") +
-      `YALNIZCA şu JSON şemasında, tek yapıda cevap ver (JSON dışında hiçbir şey yazma):\n` +
-      `{"anlam":"kelimenin bu bağlamdaki en uygun Türkçe karşılığı (en fazla 3 kelime)",` +
-      `"diger":["varsa diğer yaygın anlam 1","diğer yaygın anlam 2"],` +
-      `"aciklama":"kelimenin bu cümledeki kullanımını açıklayan 1 cümlelik Türkçe açıklama"}\n` +
-      `Kurallar: teknik terimi gerekiyorsa aynen bırak; "diger" listesi boş olabilir ama anahtarlar hep bulunur.`;
-    const r = await ollamaGenerate(prompt, TR_SYS);
-    if (r.down) return { down: true };
-
-    // şemalı JSON'u çöz; bozuk gelirse düz metni tek anlam olarak kullan
-    const m = r.raw.match(/\{[\s\S]*\}/);
-    let out = null;
-    if (m) {
-      try {
-        const o = JSON.parse(m[0]);
-        const t = String(o.anlam || "").trim().replace(/^["']|["']$/g, "");
-        if (t) {
-          out = {
-            t,
-            other: (Array.isArray(o.diger) ? o.diger : [])
-              .map((x) => String(x).trim()).filter(Boolean).slice(0, 3),
-            note: String(o.aciklama || "").trim()
-          };
-        }
-      } catch (e) { /* parse hatası: alta düş */ }
-    }
-    if (!out) {
-      const t = r.raw.replace(/^["']|["']$/g, "").trim();
-      out = t ? { t } : null;
-    }
-    if (out) bumpDaily();               // günlük sayaç + rozet
-    return out;
-  })().then(sendResponse);
+    return undefined;
+  })().then(sendResponse, (e) => sendResponse({ error: String(e && e.message || e) }));
   return true;   // async sendResponse
 });

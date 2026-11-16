@@ -18,22 +18,27 @@ const KR = {
     if (st.userDict) this.userDict = st.userDict;
     if (st.sentenceDict) this.sentenceDict = st.sentenceDict;
     if (st.meaningsDict) this.meaningsDict = st.meaningsDict;
+    // başka ekranlar (hover, diğer sekmeler) yazınca bellekteki kopyayı tazele
+    if (!this._syncing) {
+      this._syncing = true;
+      chrome.storage.onChanged.addListener((chg, area) => {
+        if (area !== "local") return;
+        if (chg.knownWords) this.known = new Set(chg.knownWords.newValue || []);
+        if (chg.learningWords) this.learning = new Set(chg.learningWords.newValue || []);
+        if (chg.userDict) this.userDict = chg.userDict.newValue || {};
+        if (chg.sentenceDict) this.sentenceDict = chg.sentenceDict.newValue || {};
+        if (chg.meaningsDict) this.meaningsDict = chg.meaningsDict.newValue || {};
+        if (chg.knownWords || chg.learningWords || chg.userDict || chg.sentenceDict || chg.meaningsDict)
+          document.dispatchEvent(new CustomEvent("kr-state"));
+      });
+    }
   },
 
-  async saveUserDict() {
-    await chrome.storage.local.set({ userDict: this.userDict });
-    document.dispatchEvent(new CustomEvent("kr-state"));
-  },
-
-  async saveSentenceDict() {
-    await chrome.storage.local.set({ sentenceDict: this.sentenceDict });
-    document.dispatchEvent(new CustomEvent("kr-state"));
-  },
-
-  async saveMeaningsDict() {
-    await chrome.storage.local.set({ meaningsDict: this.meaningsDict });
-    document.dispatchEvent(new CustomEvent("kr-state"));
-  },
+  /* Ollama sonuçlarını kalıcı depoya background yazar (tek yazma noktası);
+     bu fonksiyonlar yalnızca ekranı tazelemek için olay yayar. */
+  async saveUserDict() { document.dispatchEvent(new CustomEvent("kr-state")); },
+  async saveSentenceDict() { document.dispatchEvent(new CustomEvent("kr-state")); },
+  async saveMeaningsDict() { document.dispatchEvent(new CustomEvent("kr-state")); },
 
   /* cümle çevirisi ekle; sözlük şişmesin diye en eski kayıt atılır (2000 üst sınır) */
   rememberSentence(sentence, translation) {
@@ -59,7 +64,7 @@ const KR = {
     this.known.delete(w); this.learning.delete(w);
     if (st === "known") this.known.add(w);
     if (st === "learning") this.learning.add(w);
-    await chrome.storage.local.set({ knownWords: [...this.known], learningWords: [...this.learning] });
+    await KRStore.setState(w, st || null);
     document.dispatchEvent(new CustomEvent("kr-state"));   // istatistik çekmecesini canlı yenile
   },
 
@@ -239,19 +244,25 @@ const KR = {
     const base = this.userDict[w] || DICTIONARY[w] || DICTIONARY[w.replace(/'s$/, "")] || null;
     const glossEl = _kr$("#dGloss"), badge = _kr$("#dBadge");
 
-    let html = "";
+    // metinler DOM düğümüyle kurulur: sözlük/LLM içeriği HTML olarak yorumlanmaz
+    const lines = [];
     if (gloss) {
       // Domain terimi: genel anlamı gösterip doğrusunu söyle
       const domainGloss = gloss[settings.domain] || gloss.devops || gloss.software || Object.values(gloss)[0];
-      html = `<b>⚠️ Genel sözlük anlamı (yanlış):</b> ${gloss.general || "—"}<br>
-        <b>✅ ${DOMAIN_LABELS[settings.domain]} bağlamında doğru anlam:</b> ${domainGloss}`;
+      lines.push(["⚠️ Genel sözlük anlamı (yanlış):", " " + (gloss.general || "—")]);
+      lines.push(["✅ " + DOMAIN_LABELS[settings.domain] + " bağlamında doğru anlam:", " " + domainGloss]);
     }
     if (span.dataset.phraseTr) {
-      html += (html ? "<br>" : "") +
-        `<b>🔤 Kalıp: “${span.dataset.phrase}”</b> → ${span.dataset.phraseTr}`;
+      lines.push(["🔤 Kalıp: “" + span.dataset.phrase + "”", " → " + span.dataset.phraseTr]);
     }
-    if (html) {
-      glossEl.innerHTML = html;
+    if (lines.length) {
+      glossEl.replaceChildren();
+      lines.forEach(([bold, rest], i) => {
+        if (i) glossEl.appendChild(document.createElement("br"));
+        const b = document.createElement("b");
+        b.textContent = bold;
+        glossEl.append(b, rest);
+      });
       glossEl.style.display = "block";
       badge.textContent = gloss ? DOMAIN_LABELS[settings.domain] + " terimi" : "kalıp (phrase)";
       badge.classList.remove("none");
@@ -313,13 +324,13 @@ const KR = {
           items.push("• (" + (DOM_SHORT[k] || k) + ") " + v);
         }
       }
-      el.innerHTML = items.slice(0, 2).join("<br>");
+      this._fillLines(el, items.slice(0, 2).map((t) => [null, t]));
       return;
     }
 
     const arr = MEANINGS[w] || this.meaningsDict[w];
     if (!base && !arr) {
-      el.innerHTML = "";
+      el.replaceChildren();
       const word = this._ctxWord;
       KR.ollama.getMeanings(settings, word).then((list) => {
         if (list.length) {
@@ -334,19 +345,26 @@ const KR = {
     }
 
     const others = this._otherMeanings(w, base);
-    let html = "";
-    if (base) html += '<span class="ctx">💡 Bu cümlede: ' + base + '</span>';
-    if (others.length) {
-      if (base) html += "<br>";
-      html += '<span class="oth">' + others.map(o => "• " + o).join("<br>") + "</span>";
-    }
+    let lines = [];
+    if (base) lines.push(["ctx", "💡 Bu cümlede: " + base]);
+    others.forEach((o) => lines.push(["oth", "• " + o]));
     if (!base && arr && arr.length) {
-      html = '<span class="ctx">💡 ' + arr[0] + '</span>';
-      if (arr.length > 1) {
-        html += '<br><span class="oth">' + arr.slice(1, 3).map(o => "• " + o).join("<br>") + "</span>";
-      }
+      lines = [["ctx", "💡 " + arr[0]]];
+      arr.slice(1, 3).forEach((o) => lines.push(["oth", "• " + o]));
     }
-    el.innerHTML = html;
+    this._fillLines(el, lines);
+  },
+
+  /* [sınıf, metin] satırlarını <br> ile ayrılmış span'ler olarak yaz (innerHTML yok) */
+  _fillLines(el, lines) {
+    el.replaceChildren();
+    lines.forEach(([cls, txt], i) => {
+      if (i) el.appendChild(document.createElement("br"));
+      const sp = document.createElement("span");
+      if (cls) sp.className = cls;
+      sp.textContent = txt;
+      el.appendChild(sp);
+    });
   },
 
   /* tıklanan kelimenin cümlesini yarı saydam işaretle (TTS'teki sent-on görünümü) —
@@ -427,13 +445,9 @@ const KR = {
     const w = this._ctxWord.toLowerCase();
     delete this.userDict[w];
     delete this.meaningsDict[w];   // anlam listesi de aynı oturumda yanlış üretildiyse temizle
-    // hover modunun ürettiği açıklamayı da sil (kalıcı depo)
-    const st = await chrome.storage.local.get(["explainDict"]);
-    if (st.explainDict && st.explainDict[w] !== undefined) {
-      delete st.explainDict[w];
-      await chrome.storage.local.set({ explainDict: st.explainDict });
-    }
-    await Promise.all([this.saveUserDict(), this.saveMeaningsDict()]);
+    // userDict + meaningsDict + hover'ın açıklaması (explainDict) tek işlemde silinir
+    await KRStore.deleteWord(w);
+    await this.saveUserDict();
     this._redrawWord(w);
     this._renderMeanings();
     _kr$("#dBase").textContent = "(çeviri silindi — 🔄 ile yeniden çevirebilirsin)";
@@ -472,11 +486,17 @@ const KR = {
       out.textContent = await KR.ollama.translateSentence(this._detail.getSettings(), this._ctxSentence);
     } catch (e) {
       out.textContent = "";
-      _kr$("#dHint").innerHTML = "⚠️ Ollama hatası: <b>" + (e.message || e) + "</b><br>" +
-        "• Failed to fetch → Ollama kapalı, tünel yok ya da OLLAMA_ORIGINS eksik.<br>" +
-        "• HTTP 403 → OLLAMA_ORIGINS eksik (chrome-extension izni ver).<br>" +
-        "• model not found → ollama pull ile model indir ya da ⚙️ model adını düzelt.<br>" +
-        "Test: curl http://localhost:11434 → 'Ollama is running' dönmeli.";
+      const hint = _kr$("#dHint");
+      hint.replaceChildren();
+      const b = document.createElement("b");
+      b.textContent = e.message || String(e);
+      hint.append("⚠️ Ollama hatası: ", b);
+      [
+        "• Failed to fetch → Ollama kapalı, tünel yok ya da OLLAMA_ORIGINS eksik.",
+        "• HTTP 403 → OLLAMA_ORIGINS eksik (chrome-extension izni ver).",
+        "• model not found → ollama pull ile model indir ya da ⚙️ model adını düzelt.",
+        "Test: curl http://localhost:11434 → 'Ollama is running' dönmeli."
+      ].forEach((t) => hint.append(document.createElement("br"), t));
     } finally { btn.disabled = false; }
   },
 

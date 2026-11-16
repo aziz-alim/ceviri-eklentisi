@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Çeviri Eklentisi — Hover Çevirmen",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Herhangi bir web sayfasında kelimenin üzerine gel → anlamı baloncukta gör. Google Translate tarzı hover çeviri; tamamen local sözlük + opsiyonel Ollama. Okuma modu ve domain bazlı (DevOps vb.) terim sözlüğü dahil.",
   "permissions": [
     "sidePanel",
     "activeTab",
     "scripting",
     "storage",
+    "unlimitedStorage",
     "tabs"
   ],
   "side_panel": {
@@ -30,7 +31,7 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["js/dictionary.js", "js/glossary.js", "js/hover.js"],
+      "js": ["js/store.js", "js/dictionary.js", "js/glossary.js", "js/hover.js"],
       "css": ["css/hover.css"],
       "run_at": "document_idle",
       "all_frames": true

@@ -36,6 +36,17 @@ ollama pull llama3.1   # veya llama3.2, qwen2.5 vb.
 ollama serve
 ```
 
+Eklenti Ollama'ya `chrome-extension://` kökeninden istek atar; Ollama bu kökene izin vermezse **HTTP 403** döner. Bir kez izin ver:
+
+```bash
+# macOS (Ollama uygulaması): ayarı kaydet, sonra Ollama'yı yeniden başlat
+launchctl setenv OLLAMA_ORIGINS "chrome-extension://*"
+# Linux / terminalden çalıştırma:
+OLLAMA_ORIGINS="chrome-extension://*" ollama serve
+```
+
+Ollama 0.5 ve sonrası JSON şemalı çıktıyı destekler; eklenti bunu kullanır, eski sürümlerde otomatik olarak düz JSON moduna düşer.
+
 Ollama yoksa yerleşik sözlük + alan sözlüğü (DevOps terimleri dahil) çevrimdışı çalışmaya devam eder; hover balonunda sadece "yerleşik sözlükte yok" görürsün.
 
 ## Sınırlar
@@ -48,7 +59,7 @@ Ollama yoksa yerleşik sözlük + alan sözlüğü (DevOps terimleri dahil) çev
 ```
 ceviri-eklentisi/
 ├── manifest.json        # MV3 tanımı (content script + popup + kısayol)
-├── background.js        # Ollama proxy + Alt+Shift+K aç/kapa + rozet
+├── background.js        # tek Ollama katmanı (kuyruk, zaman aşımı) + tek yazma noktası + Alt+Shift+K + rozet
 ├── popup.html, js/popup.js   # ikon menüsü: hover anahtarı + alan seçici
 ├── js/hover.js, css/hover.css # sayfa üstü hover baloncuğu (ana özellik)
 ├── sidepanel.html/js    # okuma modu + detay çekmecesi
@@ -57,7 +68,8 @@ ceviri-eklentisi/
 └── js/
     ├── dictionary.js    # yerleşik İng-Tr sözlük + yaygın anlamlar
     ├── glossary.js      # DevOps/Yazılım bağlamsal terimler + kalıplar
-    └── ollama.js        # okuma modu LLM istemcisi
+    ├── ollama.js        # yan panel/okuyucu için background'a mesaj atan ince istemci
+    └── store.js         # ortak yazma yardımcıları (KRStore) + yerel gün anahtarı
 ```
 
 ## Yol haritası önerileri
