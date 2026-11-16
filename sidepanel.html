@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Çeviri Eklentisi</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="toolbar">
+    <button id="btnMenu" title="Menü ve istatistikler">☰</button>
+    <select id="domain" title="Alan seç (bağlamsal anlamlar için)">
+      <option value="devops">DevOps / SRE</option>
+      <option value="software">Yazılım Geliştirme</option>
+      <option value="general">Genel</option>
+    </select>
+    <button id="btnExtract">📖 Sayfayı okuma moduna al</button>
+    <button id="btnLibrary" title="Kayıtlı sayfalar">📚</button>
+    <button id="btnOptions" title="Ayarlar">⚙️</button>
+  </div>
+  <div id="status"></div>
+  <div id="reader">
+    <div class="empty-state">
+      <div class="big">📖</div>
+      Bir makale/test sayfasında <b>“Sayfayı okuma moduna al”</b> butonuna bas.<br>
+      Metin buraya gelecek, kelimeye tıklayınca anlamını görürsün.
+    </div>
+  </div>
+  <div id="library"></div>
+
+  <div id="detail">
+    <button id="btnCloseDetail" title="Kapat">✕</button>
+    <div class="head">
+      <span id="dWord"></span>
+      <span id="dBase"></span>
+      <span id="dBadge" class="none">genel sözlük</span>
+    </div>
+    <div id="dSentence"></div>
+    <div id="dSentenceTr"></div>
+    <div id="dGloss" style="display:none"></div>
+    <div id="dMeanings"></div>
+    <div class="actions">
+      <button id="btnTranslate">🌐 Cümlenin tam çevirisini al</button>
+      <button id="btnKnown">✓ Bu kelimeyi biliyorum</button>
+      <button id="btnExplain">🧠 Kelimenin bu cümledeki anlamını açıkla</button>
+      <button id="btnRetranslate" title="Bu kelimeyi Ollama ile yeniden çevir">🔄 Anlamı yeniden çevir</button>
+      <button id="btnDeleteMeaning" style="display:none" title="Kayıtlı Ollama çevirisini sil">🗑 Çeviriyi sil</button>
+    </div>
+    <div id="dResult"></div>
+    <div id="dHint"></div>
+  </div>
+
+  <script src="js/dictionary.js"></script>
+  <script src="js/wordui.js"></script>
+  <script src="js/glossary.js"></script>
+  <script src="js/ollama.js"></script>
+  <script src="js/sidepanel.js"></script>
+</body>
+</html>

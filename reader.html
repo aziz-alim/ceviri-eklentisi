@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Çeviri Eklentisi — Okuma Modu</title>
+<link rel="stylesheet" href="css/reader.css">
+</head>
+<body>
+  <div id="topbar">
+    <button id="btnMenu" title="Menü ve istatistikler">☰</button>
+    <button id="btnClose" title="Sekmeyi kapat">✕</button>
+    <select id="domain" title="Alan seç">
+      <option value="devops">DevOps / SRE</option>
+      <option value="software">Yazılım Geliştirme</option>
+      <option value="general">Genel</option>
+    </select>
+    <div id="spacer"></div>
+  </div>
+
+  <div id="tts">
+    <button id="btnPlay" title="Oynat / Duraklat">▶</button>
+    <button id="btnStop" class="sec" title="Durdur">⏹</button>
+    <select id="rate" title="Hız">
+      <option value="0.5">0,5 kat</option>
+      <option value="0.75">0,75 kat</option>
+      <option value="1" selected>1 kat</option>
+      <option value="1.25">1,25 kat</option>
+      <option value="1.5">1,5 kat</option>
+      <option value="2">2 kat</option>
+    </select>
+    <select id="voice" title="Ses"></select>
+  </div>
+
+  <div id="reader"></div>
+
+  <div id="detail">
+    <button id="btnCloseDetail" title="Kapat">✕</button>
+    <div class="head">
+      <span id="dWord"></span>
+      <span id="dBase"></span>
+      <span id="dBadge" class="none">genel sözlük</span>
+    </div>
+    <div id="dSentence"></div>
+    <div id="dSentenceTr"></div>
+    <div id="dGloss" style="display:none"></div>
+    <div id="dMeanings"></div>
+    <div class="actions">
+      <button id="btnTranslate">🌐 Cümlenin tam çevirisini al</button>
+      <button id="btnKnown">✓ Bu kelimeyi biliyorum</button>
+      <button id="btnExplain">🧠 Kelimenin bu cümledeki anlamını açıkla</button>
+      <button id="btnRetranslate" title="Bu kelimeyi Ollama ile yeniden çevir">🔄 Anlamı yeniden çevir</button>
+      <button id="btnDeleteMeaning" style="display:none" title="Kayıtlı Ollama çevirisini sil">🗑 Çeviriyi sil</button>
+    </div>
+    <div id="dResult"></div>
+    <div id="dHint"></div>
+  </div>
+
+  <script src="js/dictionary.js"></script>
+  <script src="js/wordui.js"></script>
+  <script src="js/glossary.js"></script>
+  <script src="js/ollama.js"></script>
+  <script src="js/reader.js"></script>
+</body>
+</html>

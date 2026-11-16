@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "Çeviri Eklentisi — Hover Çevirmen",
+  "version": "2.0.0",
+  "description": "Herhangi bir web sayfasında kelimenin üzerine gel → anlamı baloncukta gör. Google Translate tarzı hover çeviri; tamamen local sözlük + opsiyonel Ollama. Okuma modu ve domain bazlı (DevOps vb.) terim sözlüğü dahil.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Çeviri Eklentisi",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["js/dictionary.js", "js/glossary.js", "js/hover.js"],
+      "css": ["css/hover.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "commands": {
+    "toggle-hover": {
+      "suggested_key": {
+        "default": "Alt+Shift+K"
+      },
+      "description": "Hover çeviriyi aç/kapat"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ]
+}

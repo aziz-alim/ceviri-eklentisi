@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #1e1f24; color: #e8e9ec;
+    width: 260px; margin: 0; padding: 14px 16px;
+  }
+  .head { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+  .sub { font-size: 11.5px; color: #9aa0ab; margin-bottom: 12px; }
+  .row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 11px; background: #26272e; border: 1px solid #3a3b44;
+    border-radius: 10px; margin-bottom: 8px; font-size: 13px;
+  }
+  .row small { display: block; color: #9aa0ab; font-size: 10.5px; margin-top: 1px; }
+  /* iOS tarzı anahtar */
+  .sw { position: relative; width: 40px; height: 22px; flex: none; }
+  .sw input { opacity: 0; width: 0; height: 0; }
+  .sw i {
+    position: absolute; inset: 0; border-radius: 22px; background: #3a3b44;
+    transition: .15s; cursor: pointer;
+  }
+  .sw i::before {
+    content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%;
+    background: #e8e9ec; top: 3px; left: 3px; transition: .15s;
+  }
+  .sw input:checked + i { background: #34c98e; }
+  .sw input:checked + i::before { transform: translateX(18px); }
+  select {
+    background: #26272e; color: #e8e9ec; border: 1px solid #3a3b44;
+    border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 12px; width: 128px;
+  }
+  .btns { display: flex; gap: 8px; margin-top: 12px; }
+  .btns button {
+    flex: 1; background: #4f8cff; color: #fff; border: none; border-radius: 8px;
+    padding: 8px 0; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  }
+  .btns button.ghost { background: #26272e; border: 1px solid #3a3b44; }
+  .hint { font-size: 10.5px; color: #9aa0ab; margin-top: 10px; text-align: center; }
+  kbd {
+    background: #26272e; border: 1px solid #3a3b44; border-radius: 4px;
+    padding: 0 4px; font-size: 10px;
+  }
+</style>
+</head>
+<body>
+  <div class="head">📖 Çeviri Eklentisi</div>
+  <div class="sub">Kelimenin üzerine gel → anlamı gör<br>Varsayılan kapalı — açtığın sitelerde çalışır</div>
+
+  <div class="row">
+    <div>Hover çeviri<small>sayfada kelimenin üzerine gelince</small></div>
+    <label class="sw"><input type="checkbox" id="swHover"><i></i></label>
+  </div>
+
+  <div class="row">
+    <div>Alan<small id="domHint">bu site için</small></div>
+    <select id="selDomain">
+      <option value="devops">DevOps / SRE</option>
+      <option value="software">Yazılım</option>
+      <option value="general">Genel</option>
+    </select>
+  </div>
+
+  <div class="row" id="sugRow" style="display:none;border-color:#f5a623">
+    <div>💡 Alan önerisi<small id="sugText"></small></div>
+    <button id="btnSug" style="padding:6px 12px;font-size:11.5px;margin-top:0">Uygula</button>
+  </div>
+
+  <div class="row">
+    <div>Renklendirme<small>✓ yeşil · 📖 mor alt çizgi</small></div>
+    <label class="sw"><input type="checkbox" id="swHl"><i></i></label>
+  </div>
+
+  <div class="row" id="rowSite" style="display:none">
+    <div>Bu sitede<small id="siteHost"></small></div>
+    <label class="sw"><input type="checkbox" id="swSite"><i></i></label>
+  </div>
+
+  <div class="btns">
+    <button id="btnPanel">📖 Okuma paneli</button>
+    <button id="btnOptions" class="ghost">⚙️ Ayarlar</button>
+  </div>
+
+  <div class="hint">Hızlı aç/kapat: <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd><span id="todayCount"></span></div>
+
+  <script src="js/popup.js"></script>
+</body>
+</html>

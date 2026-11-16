@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Çeviri Eklentisi — Ayarlar</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #1e1f24; color: #e8e9ec; max-width: 720px; margin: 0 auto; padding: 24px; line-height: 1.7; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 16px; margin: 28px 0 8px; color: #4f8cff; }
+  .muted { color: #9aa0ab; font-size: 13px; }
+  label { display: block; margin-top: 12px; font-size: 13px; color: #9aa0ab; }
+  input, textarea, select { width: 100%; background: #26272e; color: #e8e9ec; border: 1px solid #3a3b44; border-radius: 8px; padding: 9px 10px; font: inherit; }
+  textarea { min-height: 90px; font-family: ui-monospace, monospace; font-size: 13px; }
+  button { background: #4f8cff; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; margin-top: 10px; cursor: pointer; }
+  button.ghost { background: #26272e; border: 1px solid #3a3b44; }
+  #saved { color: #34c98e; font-size: 13px; margin-left: 10px; visibility: hidden; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #3a3b44; vertical-align: top; }
+  th { color: #9aa0ab; }
+  td .del { background: none; border: none; color: #ff6b6b; cursor: pointer; font-size: 15px; }
+  code { background: #26272e; padding: 1px 5px; border-radius: 4px; }
+  /* tablo loader'ı + sayfalı yükleme */
+  .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #3a3b44;
+    border-top-color: #4f8cff; border-radius: 50%; animation: krspin .8s linear infinite;
+    vertical-align: -2px; margin-right: 6px; }
+  @keyframes krspin { to { transform: rotate(360deg); } }
+  .loader-row td, .more-row td { text-align: center; color: #9aa0ab; padding: 14px; }
+  .more-btn { width: 100%; margin-top: 0; }
+  /* durum sekmeleri + satır durum noktası */
+  .tabs { display: flex; gap: 6px; margin: 10px 0; }
+  .tabs button { background: #26272e; color: #9aa0ab; border: 1px solid #3a3b44; border-radius: 8px;
+    padding: 6px 12px; font-size: 12.5px; font-weight: 600; margin-top: 0; cursor: pointer; }
+  .tabs button.on { background: rgba(79,140,255,.14); border-color: #4f8cff; color: #4f8cff; }
+  .tabs .cnt { opacity: .7; font-weight: 400; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
+  .dot.known { background: #34c98e; }
+  .dot.learning { background: #c792ea; }
+  .dot.unknown { background: #55565e; }
+  /* SRS quiz kutusu */
+  .quiz { background: #26272e; border: 1px solid #3a3b44; border-radius: 12px; padding: 18px; margin-top: 10px; }
+  #qWord { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .qbtns { display: flex; gap: 8px; margin-top: 14px; }
+  .qbtns button { margin-top: 0; }
+  .qmeta { font-size: 11.5px; color: #9aa0ab; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <h1>⚙️ Çeviri Eklentisi Ayarları</h1>
+  <p class="muted">Tüm özellikler local çalışır. Cümle çevirisi ve bağlamsal açıklama için bilgisayarında <a href="https://ollama.com" style="color:#4f8cff">Ollama</a> çalıştırman gerekir (opsiyonel).</p>
+  <p class="muted" id="statsLine"></p>
+
+  <h2>Hover çeviri</h2>
+  <label style="display:flex;align-items:center;gap:10px;color:#e8e9ec;cursor:pointer">
+    <input type="checkbox" id="hoverEnabled" style="width:auto"> Sayfalarda hover çeviri açık (kelimenin üzerine gelince anlam baloncuğu)
+  </label>
+  <label style="display:flex;align-items:center;gap:10px;color:#e8e9ec;cursor:pointer">
+    <input type="checkbox" id="highlightEnabled" style="width:auto"> Kelime renklendirme (✓ bilinen yeşil, 📖 öğrenilen mor alt çizgi)
+  </label>
+  <p class="muted">Kısayol: <code>Alt+Shift+K</code> ile hızlıca açıp kapatabilirsin. Eklenti ikonundaki ⏸ rozeti kapalı olduğunu gösterir.</p>
+
+  <h2>Ollama (local LLM)</h2>
+  <label>Ollama adresi</label>
+  <input id="ollamaUrl" placeholder="http://localhost:11434">
+  <label>Model</label>
+  <input id="model" placeholder="llama3.1">
+  <p class="muted">Kurulum: <code>curl -fsSL https://ollama.com/install.sh | sh</code> → <code>ollama pull llama3.1</code> → <code>ollama serve</code>. Modeli hiç kurmadan sadece sözlük özelliklerini kullanabilirsin.</p>
+
+  <h2>Alan (domain)</h2>
+  <p class="muted">Alan seçimi artık <b>site bazlı</b>: eklenti ikonundaki popup'tan seçtiğin alan o siteye kaydedilir (örn. DevOps okuduğun sitede DevOps, diğer sitelerde genel çeviri). Buradan varsayılan alanı belirle:</p>
+  <select id="defDomain" style="max-width:220px">
+    <option value="devops">DevOps / SRE</option>
+    <option value="software">Yazılım</option>
+    <option value="general">Genel</option>
+  </select>
+
+  <h2>🧠 Tekrar (SRS) <span id="srsInfo" class="muted"></span></h2>
+  <p class="muted">"📖 Öğreniyorum" kelimeleri aralıklı tekrarla sorulur: ✅ bildikçe aralık büyür (10 dk → 12 sa → 2 gün → 5 gün → 15 gün), 4. seviyede kelime "✓ Biliyorum"a terfi eder.</p>
+  <div id="quizBox" class="quiz">
+    <div id="qWord"></div>
+    <div id="qAnswer" style="display:none;margin-top:4px"></div>
+    <div id="qNote" class="qmeta" style="display:none"></div>
+    <div class="qbtns">
+      <button id="qShow" class="ghost">Göster</button>
+      <button id="qKnow" style="display:none;background:#2e9e73">✅ Bildim</button>
+      <button id="qMiss" style="display:none;background:#8a4040">❌ Bilemedim</button>
+    </div>
+  </div>
+
+  <h2>Çevrilen kelimeler <span id="wordCount" class="muted"></span></h2>
+  <p class="muted">Hover ile Ollama'ya çevirtilen kelimeler burada birikir (anlam + diğer anlamlar + açıklama). Yanlış olanları sil — kelimeye tekrar geldiğinde yeni şemayla yeniden çevrilir.</p>
+  <div class="tabs" id="statusTabs">
+    <button data-f="all" class="on">Tümü <span class="cnt" data-c="all"></span></button>
+    <button data-f="known">✓ Biliyorum <span class="cnt" data-c="known"></span></button>
+    <button data-f="learning">📖 Öğreniyorum <span class="cnt" data-c="learning"></span></button>
+    <button data-f="unknown">○ Bilinmiyor <span class="cnt" data-c="unknown"></span></button>
+  </div>
+  <input id="wordFilter" placeholder="🔍 kelime ara…" style="margin-bottom:8px">
+  <table id="wordTable">
+    <thead><tr><th>Kelime</th><th>Anlam</th><th>Diğer anlamlar</th><th>Açıklama</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="muted" id="wordEmpty" style="display:none">Henüz çevrilmiş kelime yok. Bir sayfada hover'ı açıp kelimelerin üzerine gel — burada listelenir.</p>
+
+  <h2>Çeviri deposu</h2>
+  <p class="muted">Ollama ile çevrilmiş tüm kelime kayıtlarını tek şemaya uydurur: <b>anlam + diğer anlamlar + Türkçe açıklama</b>. Eski/bozuk formatlı kayıtlar onarılır, onarılamayanlar silinir (kelimeye tekrar gelince yeni şemayla otomatik çevrilir).</p>
+  <button class="ghost" id="btnCleanup">🧹 Çevirileri temizle ve formata uydur</button>
+  <span id="cleanupResult" class="muted" style="margin-left:10px"></span>
+
+  <div style="margin-top:24px">
+    <button id="btnSave">Kaydet</button>
+    <button class="ghost" id="btnReset">Varsayılanlara dön</button>
+    <span id="saved">✓ Kaydedildi</span>
+  </div>
+
+  <script src="js/dictionary.js"></script>
+  <script src="js/options.js"></script>
+</body>
+</html>
