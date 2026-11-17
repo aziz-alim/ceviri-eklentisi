@@ -76,7 +76,7 @@
       if (chg.meaningsDict) meaningsDict = chg.meaningsDict.newValue || {};
       if (chg.explainDict) explainDict = chg.explainDict.newValue || {};
       if (chg.sentenceDict) sentenceDict = chg.sentenceDict.newValue || {};
-      if (chg.ctxDict) ctxDict = chg.ctxDict.newValue || {};
+      if (chg.ctxDict) { ctxDict = chg.ctxDict.newValue || {}; scheduleWidget(); }
       if (chg.contextLog && !ctxDirty) contextLog = chg.contextLog.newValue || {};
       if (chg.knownWords) { known = new Set(chg.knownWords.newValue || []); scheduleHlScan(250); }
       if (chg.learningWords) { learning = new Set(chg.learningWords.newValue || []); scheduleHlScan(250); }
@@ -361,6 +361,7 @@
   /* ---- mouse akışı ---- */
   function onMouseMove(e) {
     if (!enabled) return;
+    if (wHost && e.target === wHost) { scheduleHide(); return; }   // köşe rozetinin üstü
     if (tip && tip.contains(e.target)) {           // balonun üstündeyiz: kapatma
       clearTimeout(hideTimer);
       clearTimeout(showTimer);
@@ -378,6 +379,7 @@
   function onSelectEnd(e) {
     if (!enabled) return;
     if (tip && tip.contains(e.target)) return;
+    if (wHost && e.target === wHost) return;
     setTimeout(() => {                             // seçim nesnesi otursun
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) return;
@@ -775,12 +777,12 @@
     };
     if (focus) consider(focus, true);
     for (const m of sentence.match(HL_WORD) || []) consider(m, false);
-    if (!targets.length) return false;
+    if (!targets.length) { if (prefetch) { bgSkipped.add(sentence); scheduleWidget(); } return false; }
     ctxPending.set(sentence, new Set(targets.map((x) => x.w)));
     if (prefetch) { bgPending.add(sentence); bgInflight++; bgSent++; }
     const finish = () => {
       ctxPending.delete(sentence);
-      if (prefetch) { bgPending.delete(sentence); bgInflight--; setTimeout(pumpBg, 0); }
+      if (prefetch) { bgPending.delete(sentence); bgInflight--; setTimeout(pumpBg, 0); scheduleWidget(); }
     };
     try {
       chrome.runtime.sendMessage({
@@ -802,6 +804,7 @@
         }
         if (!resp || !resp.entry) {
           if (resp && resp.down) { llmDown = true; llmDownAt = Date.now(); }
+          else if (prefetch) bgFailed.add(sentence);
           if (ctx && ctx.sentence === sentence) renderTip();   // başarısızsa kelime çevirisine düşer
           return;
         }
@@ -835,6 +838,11 @@
   const bgDone = new Set();              // kuyruğa alınmış/işlenmiş cümleler
   const bgPending = new Set();           // background'da bekleyen ön çeviri cümleleri
   const promoted = new Set();
+  const prefetchBlocks = [];             // izlenen paragraflar (belge sırası)
+  const pageSents = new Set();           // sayfadaki çevrilebilir cümleler (yüzde paydası)
+  const bgSkipped = new Set();           // çevrilecek bilinmeyen kelime yok (bilinen/sık kelimeler)
+  const bgFailed = new Set();            // ön çevirisi başarısız cümleler
+  let bgPaused = false, bgAllMode = false;
 
   function prefetchOn() {
     return enabled && settings.autoTranslate !== false && !/^tr\b/i.test(document.documentElement.lang || "");
@@ -869,7 +877,10 @@
     dwellTimers.forEach((t) => clearTimeout(t));
     dwellTimers.clear();
     bgQueue = [];
+    prefetchBlocks.length = 0;
+    pageSents.clear();
     if (bgPending.size) try { chrome.runtime.sendMessage({ type: "krh-bg-cancel" }, () => void chrome.runtime.lastError); } catch (e) {}
+    scheduleWidget();
   }
   function scheduleBlockScan(ms) {
     if (!io) return;
@@ -888,8 +899,12 @@
       const len = el.textContent.length;
       if (len < 20 || len > 5000) continue;
       io.observe(el);
+      prefetchBlocks.push(el);
+      for (const sn of sentencesOf(el.textContent)) if (ctxEligible(sn) && looksEnglish(sn)) pageSents.add(sn);
       n++;
     }
+    if (bgAllMode) enqueueAll();
+    scheduleWidget();
   }
   function onIntersect(entries) {
     for (const en of entries) {
@@ -908,28 +923,161 @@
         dwellTimers.delete(el);
       }
     }
+    scheduleWidget();
   }
   function enqueueBlock(el) {
     for (const sn of sentencesOf(el.textContent)) {
-      if (bgDone.has(sn) || ctxDict[sn] || !ctxEligible(sn) || !looksEnglish(sn)) continue;
+      if (bgDone.has(sn) || ctxDict[sn] || bgSkipped.has(sn) || bgFailed.has(sn) ||
+          !ctxEligible(sn) || !looksEnglish(sn)) continue;
       bgDone.add(sn);
       bgQueue.push({ s: sn, el });
     }
     pumpBg();
+    scheduleWidget();
   }
+  function enqueueAll() { prefetchBlocks.forEach((el) => enqueueBlock(el)); }
   function pumpBg() {
     if (llmDown && Date.now() - llmDownAt > 60000) llmDown = false;
-    if (llmDown) { setTimeout(pumpBg, 61000); return; }
-    while (bgInflight < BG_INFLIGHT && bgQueue.length && bgSent < PREFETCH_PAGE_MAX &&
+    if (llmDown) { setTimeout(pumpBg, 61000); scheduleWidget(); return; }
+    while (!bgPaused && bgInflight < BG_INFLIGHT && bgQueue.length && bgSent < PREFETCH_PAGE_MAX &&
            !document.hidden && prefetchOn()) {
-      // önce hâlâ ekranda olan paragraflar; ekrandan çıkanlar sonra yeniden görünürse tekrar sıraya girer
+      // önce hâlâ ekranda olan paragraflar; "tüm sayfa" modunda sonra belge sırasıyla geri kalanlar.
+      // Normal modda ekrandan çıkanlar düşer, yeniden görünürse tekrar sıraya girer.
       let i = bgQueue.findIndex((q) => visibleBlocks.has(q.el));
+      if (i < 0 && bgAllMode) i = 0;
       if (i < 0) { bgQueue.forEach((q) => bgDone.delete(q.s)); bgQueue = []; break; }
       const [it] = bgQueue.splice(i, 1);
       if (ctxDict[it.s]) continue;
       requestAnalyze(it.s, null, { prefetch: true });
     }
   }
+  /* ---- köşe rozeti: ön çeviri ilerlemesi (tıklayınca ayrıntı paneli) ----
+     Shadow DOM içinde; sayfanın CSS'i etkilemez, hover/seçim olayları bu kutuyu yok sayar. */
+  let wHost = null, wRoot = null, wOpen = false, wHidden = false, wTimer = null;
+  const W_CSS = `
+    :host { all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+      font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; color: #e8e9ec; }
+    .pill { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+      background: #232428; border: 1px solid #3a3b44; border-radius: 999px; padding: 6px 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.45); }
+    .pill:hover { border-color: #5b5d6a; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b6f7a; }
+    .dot.run { background: #f2b84b; animation: pulse 1s ease-in-out infinite; }
+    .dot.ok { background: #5fcf80; } .dot.err { background: #e86a6a; }
+    @keyframes pulse { 50% { opacity: .35; } }
+    .panel { position: absolute; right: 0; bottom: calc(100% + 8px); width: 260px; background: #232428;
+      border: 1px solid #3a3b44; border-radius: 12px; padding: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.55); }
+    .panel[hidden] { display: none; }
+    .title { font-weight: 600; margin-bottom: 8px; display: flex; justify-content: space-between; }
+    .bar { height: 6px; background: #3a3b44; border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
+    .fill { height: 100%; background: #6aa9ff; width: 0; transition: width .3s; }
+    .row { display: flex; justify-content: space-between; color: #b9bcc6; }
+    .row b { color: #e8e9ec; font-weight: 600; }
+    .status { margin-top: 8px; color: #9ec9f0; }
+    .btns { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+    button { all: unset; cursor: pointer; background: #3c4043; border-radius: 6px; padding: 4px 9px; font-size: 12px; }
+    button:hover { background: #4a4f55; }
+    .x { background: none; padding: 0 2px; color: #9aa0a6; }`;
+
+  function ensureWidget() {
+    if (wHost) return;
+    wHost = document.createElement("div");
+    wHost.id = "krh-progress";
+    wRoot = wHost.attachShadow({ mode: "open" });
+    const st = document.createElement("style");
+    st.textContent = W_CSS;
+    wRoot.appendChild(st);
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.hidden = true;
+    panel.innerHTML =                       // sabit iskelet; değişken metinler textContent ile yazılır
+      '<div class="title"><span>🌐 Arka plan çevirisi</span><button class="x" data-a="hide" title="Bu sayfada gizle">✕</button></div>' +
+      '<div class="bar"><div class="fill"></div></div>' +
+      '<div class="row"><span>Sayfa</span><b data-k="page"></b></div>' +
+      '<div class="row"><span>Ekranda</span><b data-k="vis"></b></div>' +
+      '<div class="row"><span>Sırada / çevriliyor</span><b data-k="queue"></b></div>' +
+      '<div class="row" data-k="failrow"><span>Hata</span><b data-k="fail"></b></div>' +
+      '<div class="status" data-k="status"></div>' +
+      '<div class="btns"><button data-a="pause"></button><button data-a="all"></button></div>';
+    const pill = document.createElement("div");
+    pill.className = "pill";
+    pill.innerHTML = '<span class="dot"></span><span data-k="pct"></span>';
+    wRoot.append(panel, pill);
+    pill.addEventListener("click", () => { wOpen = !wOpen; renderWidget(); });
+    panel.addEventListener("click", (e) => {
+      const a = e.target.closest && e.target.closest("button") && e.target.closest("button").dataset.a;
+      if (a === "hide") { wHidden = true; renderWidget(); }
+      if (a === "pause") setBgPaused(!bgPaused);
+      if (a === "all") {
+        bgAllMode = !bgAllMode;
+        if (bgAllMode) enqueueAll(); else pumpBg();
+        renderWidget();
+      }
+    });
+    (document.body || document.documentElement).appendChild(wHost);
+  }
+
+  function setBgPaused(v) {
+    bgPaused = v;
+    if (v) {
+      if (bgPending.size) try { chrome.runtime.sendMessage({ type: "krh-bg-cancel" }, () => void chrome.runtime.lastError); } catch (e) {}
+    } else {
+      if (bgAllMode) enqueueAll(); else visibleBlocks.forEach((el) => enqueueBlock(el));
+      pumpBg();
+    }
+    renderWidget();
+  }
+
+  function progressStats() {
+    const isDone = (sn) => !!ctxDict[sn] || bgSkipped.has(sn);
+    let done = 0, fail = 0;
+    pageSents.forEach((sn) => { if (isDone(sn)) done++; else if (bgFailed.has(sn)) fail++; });
+    const vis = new Set();
+    visibleBlocks.forEach((el) => sentencesOf(el.textContent).forEach((sn) => { if (pageSents.has(sn)) vis.add(sn); }));
+    let visDone = 0;
+    vis.forEach((sn) => { if (isDone(sn)) visDone++; });
+    return { total: pageSents.size, done, fail, vis: vis.size, visDone, queued: bgQueue.length, running: bgInflight };
+  }
+
+  function scheduleWidget() {
+    if (wTimer) return;
+    wTimer = setTimeout(() => { wTimer = null; renderWidget(); }, 300);
+  }
+
+  function renderWidget() {
+    const show = prefetchOn() && !wHidden && pageSents.size > 0;
+    if (!show) { if (wHost) wHost.style.setProperty("display", "none", "important"); return; }
+    ensureWidget();
+    wHost.style.removeProperty("display");
+    const q = (k) => wRoot.querySelector(`[data-k="${k}"]`);
+    const s = progressStats();
+    const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+    const busy = !bgPaused && (s.running > 0 || s.queued > 0);
+    let status, dot;
+    if (llmDown) { status = "⚠ Ollama'ya ulaşılamıyor (1 dk sonra tekrar denenecek)"; dot = "err"; }
+    else if (bgPaused) { status = "⏸ Duraklatıldı"; dot = ""; }
+    else if (busy) { status = "⏳ Çevriliyor…"; dot = "run"; }
+    else if (bgSent >= PREFETCH_PAGE_MAX) { status = `Sayfa sınırına ulaşıldı (${PREFETCH_PAGE_MAX} istek)`; dot = ""; }
+    else if (s.done >= s.total) { status = "✓ Sayfanın tamamı hazır"; dot = "ok"; }
+    else if (s.visDone >= s.vis) { status = bgAllMode ? "⏳ Sıradaki paragraflar bekleniyor…" : "✓ Ekrandakiler hazır — kaydırdıkça devam eder"; dot = "ok"; }
+    else { status = "⏳ Bekleniyor…"; dot = "run"; }
+
+    q("pct").textContent = `%${pct}`;
+    wRoot.querySelector(".dot").className = "dot " + dot;
+    const panel = wRoot.querySelector(".panel");
+    panel.hidden = !wOpen;
+    if (!wOpen) return;
+    wRoot.querySelector(".fill").style.width = pct + "%";
+    q("page").textContent = `${s.done} / ${s.total} cümle · %${pct}`;
+    q("vis").textContent = `${s.visDone} / ${s.vis}`;
+    q("queue").textContent = `${s.queued} / ${s.running}`;
+    q("fail").textContent = String(s.fail);
+    q("failrow").style.display = s.fail ? "" : "none";
+    q("status").textContent = status;
+    wRoot.querySelector('[data-a="pause"]').textContent = bgPaused ? "▶ Devam et" : "⏸ Duraklat";
+    wRoot.querySelector('[data-a="all"]').textContent = bgAllMode ? "Yalnız ekrandakiler" : "⇣ Tüm sayfayı çevir";
+  }
+
   /* kullanıcı ön çevirisi kuyrukta bekleyen bir cümleye geldi: background'da öne al */
   function promoteIfQueued(sentence) {
     if (!bgPending.has(sentence) || promoted.has(sentence)) return;
