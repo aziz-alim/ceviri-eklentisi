@@ -20,6 +20,7 @@
   let meaningsDict = {};
   let explainDict = {};                  // Ollama'nın ürettiği Türkçe açıklamalar (kalıcı)
   let sentenceDict = {};                 // cümle -> Türkçe çevirisi (kalıcı, yan panelle ortak)
+  let ctxDict = {};                      // cümle -> {tr, w: {kelime: {a: bu cümledeki anlam, k: çevirideki karşılık, l: kök, n: not}}}
   let contextLog = {};                   // kelime -> [{s: cümle, h: site, t: zaman}] (en fazla 5/kelime)
   let ctxDirty = false, ctxFlushTimer = null, ctxQueue = [];
   let known = new Set(), learning = new Set();
@@ -37,7 +38,7 @@
     try {
       const st = await chrome.storage.local.get(
         ["settings", "siteRules", "siteDomains", "customGlossary", "userDict", "meaningsDict",
-         "explainDict", "sentenceDict", "contextLog", "knownWords", "learningWords"]);
+         "explainDict", "sentenceDict", "ctxDict", "contextLog", "knownWords", "learningWords"]);
       if (st.settings) settings = { ...settings, ...st.settings };
       siteRules = st.siteRules || {};
       siteDomains = st.siteDomains || {};
@@ -47,6 +48,7 @@
       meaningsDict = st.meaningsDict || {};
       explainDict = st.explainDict || {};
       sentenceDict = st.sentenceDict || {};
+      ctxDict = st.ctxDict || {};
       contextLog = st.contextLog || {};
       known = new Set(st.knownWords || []);
       learning = new Set(st.learningWords || []);
@@ -72,6 +74,7 @@
       if (chg.meaningsDict) meaningsDict = chg.meaningsDict.newValue || {};
       if (chg.explainDict) explainDict = chg.explainDict.newValue || {};
       if (chg.sentenceDict) sentenceDict = chg.sentenceDict.newValue || {};
+      if (chg.ctxDict) ctxDict = chg.ctxDict.newValue || {};
       if (chg.contextLog && !ctxDirty) contextLog = chg.contextLog.newValue || {};
       if (chg.knownWords) { known = new Set(chg.knownWords.newValue || []); scheduleHlScan(250); }
       if (chg.learningWords) { learning = new Set(chg.learningWords.newValue || []); scheduleHlScan(250); }
@@ -308,10 +311,19 @@
     return null;
   }
 
+  /* alan sözlüğü: önce kelimenin kendisi, sonra kökleri (postmortems → postmortem) */
+  function glossOf(w) {
+    for (const k of [w, ...stemVariants(w)]) {
+      const g = GLOSSARY[curDomain()]?.[k] || GLOSSARY.software?.[k] || customGlossary?.[k];
+      if (g) return g;
+    }
+    return null;
+  }
+
   /* ---- anlam çözümleme (wordui.js ile aynı öncelik sırası) ---- */
   function analyze(word) {
     const w = word.toLowerCase();
-    const gloss = GLOSSARY[curDomain()]?.[w] || GLOSSARY.software?.[w] || customGlossary?.[w] || null;
+    const gloss = glossOf(w);
     const cached = llmCache.get(w);      // {t, other, note} | null | undefined
     const base = lookupDict(w) || (cached && cached.t) || null;
     return { w, gloss, base };
@@ -502,6 +514,11 @@
     delete meaningsDict[w];
     delete explainDict[w];
     await KRStore.deleteWord(w);
+    if (ctx.sentence && ctxDict[ctx.sentence]) {          // bu cümlenin bağlamlı analizi de baştan
+      ctxAsked.delete(ctx.sentence);
+      delete ctxDict[ctx.sentence];
+      await KRStore.mutate([{ op: "dictDel", store: "ctxDict", key: ctx.sentence }]);
+    }
     llmDown = false;                    // elle yenileme: "kapalı" bayrağını yok say
     llmDownAt = 0;
     renderTip();                        // kayıt silindi → spinner + yeni istek tetiklenir
@@ -556,13 +573,26 @@
     } else {
       pill.textContent = ctx.word;
       pill2.classList.add("krh-off");
+      const cw = ctxWord(ctx.sentence, w);           // bu cümledeki anlam (varsa)
+      // cümle analizi sorulup bu kelime yine de gelmediyse eski kelime çevirisine düş (döngü olmasın)
+      const ctxOk = ctxEligible(ctx.sentence) &&
+        !(!cw && ctxWasAsked(ctx.sentence, w) && !ctxPending.has(ctx.sentence));
+      if (!gloss && !cw && ctxOk) requestAnalyze(ctx.sentence, w);   // cümle bir kez analiz edilir
+      const ctxBusy = ctxOk && ctxIsPending(ctx.sentence);
       if (gloss) {
         const domainMeaning = gloss[curDomain()] || gloss.devops || gloss.software ||
           Object.values(gloss).find((v) => typeof v === "string");
         mainTxt = "✅ " + domainMeaning;
         if (gloss.general) addAlt(alt, "genel: " + gloss.general);
+      } else if (cw) {
+        mainTxt = "🎯 " + cw.a;
+        if (base && base.toLowerCase() !== cw.a.toLowerCase()) addAlt(alt, "sözlük: " + base);
       } else if (base) {
-        mainTxt = base;
+        mainTxt = base;                                // bağlamlı anlam gelince güncellenir
+      } else if (ctxBusy) {
+        mainTxt = "⏳ çevriliyor… (Ollama — local)";
+      } else if (ctxOk && !llmDown) {
+        mainTxt = "⏳ çevriliyor… (Ollama — local)";
       } else if (llmPending.has(w)) {
         mainTxt = "⏳ çevriliyor… (Ollama — local)";
       } else if (llmFailed.has(w)) {
@@ -577,14 +607,23 @@
       const arr = (cached && cached.other && cached.other.length)
         ? cached.other
         : (MEANINGS[w] || meaningsDict[w] || []);
-      const bn = (base || "").toLowerCase();
-      arr.filter((m) => m && m.toLowerCase() !== bn).slice(0, 2)
+      const skip = new Set([(base || "").toLowerCase(), cw ? cw.a.toLowerCase() : ""]);
+      arr.filter((m) => m && !skip.has(m.toLowerCase())).slice(0, 2)
         .forEach((m) => addAlt(alt, "• " + m));
-      // Türkçe açıklama: LLM şemasından ya da kalıcı depodan
-      const noteTxt = (cached && cached.note) || explainDict[w] || "";
+      // Türkçe açıklama: önce bu cümleye özel not, yoksa LLM şeması / kalıcı depo
+      const noteTxt = (cw && cw.n) || (cached && cached.note) || explainDict[w] || "";
       if (noteTxt) {
         note.textContent = "💬 " + noteTxt;
         note.classList.remove("krh-off");
+      }
+      // cümlenin çevirisi; kelimenin karşılığı vurgulu
+      const ce = ctxDict[ctx.sentence];
+      if (ce && ce.tr) {
+        fillSentence(sent, ce.tr, cw && cw.k);
+        sent.classList.remove("krh-off");
+      } else if (ctxBusy && (gloss || base)) {
+        sent.textContent = "⏳ cümledeki anlamı çözülüyor…";
+        sent.classList.remove("krh-off");
       }
     }
 
@@ -613,9 +652,10 @@
     if (sentPending.has(text) || llmDown) return;
     sentPending.add(text);
     const parts = splitSentences(text);
+    const terms = termsIn(text);
     const payload = parts.length > 1
-      ? { type: "krh-sentence-batch", sentences: parts, whole: text }
-      : { type: "krh-sentence", sentence: text };
+      ? { type: "krh-sentence-batch", sentences: parts, whole: text, terms }
+      : { type: "krh-sentence", sentence: text, terms };
     try {
       chrome.runtime.sendMessage(payload, (resp) => {
         sentPending.delete(text);
@@ -637,6 +677,122 @@
     } catch (e) {
       sentPending.delete(text);
     }
+  }
+
+  /* ---- cümle odaklı analiz: cümle çevirisi + kelimelerin bu cümledeki anlamı, tek istekte ----
+     Sonuç ctxDict[cümle]'de; aynı cümledeki diğer kelimeler beklemeden önbellekten gelir. */
+  const ctxPending = new Map();          // cümle -> Set(istekteki kelimeler)
+  const ctxAsked = new Map();            // cümle -> Set(cevabı alınmış istekteki kelimeler)
+  const STOP = new Set(("the a an and or but if then else is are was were be been being to of in on at for with by " +
+    "from as it its this that these those he she they we you i me my your our their his her them us not no yes do does " +
+    "did done has have had will would can could should may might must shall so than too very just also only into onto " +
+    "over under about after before up down out off what which who whom whose when where why how all any each some " +
+    "such there here more most other own same both few nor").split(" "));
+
+  function ctxEligible(sentence) {
+    return !!sentence && sentence.length >= 12 && (sentence.match(HL_WORD) || []).length >= 3;
+  }
+  function ctxWord(sentence, w) {
+    const e = sentence && ctxDict[sentence];
+    return (e && e.w && e.w[w]) || null;
+  }
+  function ctxIsPending(sentence) { return ctxPending.has(sentence); }
+  function ctxWasAsked(sentence, w) { const a = ctxAsked.get(sentence); return !!a && a.has(w); }
+
+  /* kısa terim ipucu: alan sözlüğündeki uzun açıklamanın baş kısmı */
+  function shortGloss(g) {
+    const v = String(g[curDomain()] || g.devops || g.software || g.general || "");
+    const head = v.split(/[:;.(]/)[0].trim();
+    return (head.length >= 3 ? head : v).slice(0, 50);
+  }
+  function candidatesOf(w) {
+    const out = [];
+    const add = (x) => { x = String(x || "").trim(); if (x && !out.some((y) => y.toLowerCase() === x.toLowerCase())) out.push(x); };
+    add(lookupDict(w));
+    (MEANINGS[w] || []).forEach(add);
+    (meaningsDict[w] || []).forEach(add);
+    return out.slice(0, 4);
+  }
+
+  /* metinde geçen alan sözlüğü terimleri (çeviri promptuna ipucu) */
+  function termsIn(text) {
+    const out = [], seen = new Set();
+    for (const m of text.match(HL_WORD) || []) {
+      const w = m.toLowerCase();
+      if (seen.has(w)) continue;
+      seen.add(w);
+      const g = glossOf(w);
+      if (g && typeof g === "object") out.push({ w, t: shortGloss(g) });
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+
+  function requestAnalyze(sentence, focus) {
+    if (llmDown && Date.now() - llmDownAt > 60000) llmDown = false;
+    if (llmDown || ctxPending.has(sentence) || ctxWasAsked(sentence, focus)) return;
+    const have = (ctxDict[sentence] && ctxDict[sentence].w) || {};
+    const targets = [], terms = [], seen = new Set();
+    const consider = (raw, isFocus) => {
+      const w = raw.toLowerCase().replace(/^[-']+|[-']+$/g, "");
+      if (seen.has(w) || w.length < 3 || /\d/.test(w)) return;
+      seen.add(w);
+      const g = glossOf(w);
+      if (g && typeof g === "object") { terms.push({ w, t: shortGloss(g) }); if (!isFocus) return; }
+      if (!isFocus && (STOP.has(w) || have[w] || known.has(w))) return;
+      if (targets.length < 12) targets.push({ w, c: candidatesOf(w) });
+    };
+    consider(focus, true);
+    for (const m of sentence.match(HL_WORD) || []) consider(m, false);
+    if (!targets.length) return;
+    ctxPending.set(sentence, new Set(targets.map((x) => x.w)));
+    try {
+      chrome.runtime.sendMessage({
+        type: "krh-analyze", sentence, focus, targets, terms,
+        domainLabel: DOMAIN_LABELS[curDomain()] || "genel"
+      }, (resp) => {
+        const asked = ctxPending.get(sentence);
+        ctxPending.delete(sentence);
+        if (chrome.runtime.lastError) return;
+        if (!(resp && resp.cancelled) && !(resp && resp.down) && asked) {
+          const a = ctxAsked.get(sentence) || new Set();
+          asked.forEach((x) => a.add(x));
+          ctxAsked.set(sentence, a);
+        }
+        if (resp && resp.cancelled) {                // imleç başka cümleye geçti: tekrar sorulabilir
+          if (ctx && ctx.sentence === sentence) renderTip();
+          return;
+        }
+        if (!resp || !resp.entry) {
+          if (resp && resp.down) { llmDown = true; llmDownAt = Date.now(); }
+          if (ctx && ctx.sentence === sentence) renderTip();   // başarısızsa kelime çevirisine düşer
+          return;
+        }
+        // kalıcı kayıt background'da; bellekteki kopyalar:
+        ctxDict[sentence] = resp.entry;
+        sentenceDict[sentence] = resp.entry.tr;
+        for (const [w, v] of Object.entries(resp.entry.w || {})) if (!userDict[w] && !lookupDict(w)) userDict[w] = v.a;
+        if (ctx && ctx.sentence === sentence) { renderTip(); placeTip(ctx.rect); }
+      });
+    } catch (e) {
+      ctxPending.delete(sentence);
+      llmDown = true;
+      llmDownAt = Date.now();
+    }
+  }
+
+  /* çeviri metnini yaz, kelimenin karşılığını kalın göster (innerHTML yok) */
+  function fillSentence(el, tr, k) {
+    el.textContent = "";
+    el.appendChild(document.createTextNode("🗨 "));
+    const i = k ? tr.toLowerCase().indexOf(k.toLowerCase()) : -1;
+    if (i < 0) { el.appendChild(document.createTextNode(tr)); return; }
+    el.appendChild(document.createTextNode(tr.slice(0, i)));
+    const b = document.createElement("b");
+    b.className = "krh-hl";
+    b.textContent = tr.slice(i, i + k.length);
+    el.appendChild(b);
+    el.appendChild(document.createTextNode(tr.slice(i + k.length)));
   }
 
   function addAlt(alt, txt) {

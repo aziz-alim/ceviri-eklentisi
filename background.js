@@ -36,11 +36,13 @@ function withStore(fn) {
   return p;
 }
 
-const DICT_STORES = ["userDict", "meaningsDict", "explainDict", "sentenceDict"];
-const DICT_CAPS = { meaningsDict: 1500, explainDict: 1500, sentenceDict: 2000 };
+const DICT_STORES = ["userDict", "meaningsDict", "explainDict", "sentenceDict", "ctxDict"];
+const DICT_CAPS = { meaningsDict: 1500, explainDict: 1500, sentenceDict: 2000, ctxDict: 2000 };
+const SENSES_MAX = 5;   // kelime katmanında tutulan farklı anlam sayısı
 const CTX_PER_WORD = 5, CTX_MAX_WORDS = 1500;
 
-/* ops: dictSet / dictDel / state / ctxAdd — bkz. js/store.js */
+/* ops: dictSet / dictDel / state / ctxAdd — bkz. js/store.js
+   iç kullanım: ctxMerge (cümle analizini mevcut kayıtla birleştir), senseAdd (kelime katmanına anlam ekle) */
 function applyOps(ops) {
   if (!Array.isArray(ops) || !ops.length) return Promise.resolve({ ok: true });
   return withStore(async () => {
@@ -49,6 +51,8 @@ function applyOps(ops) {
       if ((o.op === "dictSet" || o.op === "dictDel") && DICT_STORES.includes(o.store)) need.add(o.store);
       else if (o.op === "state") { need.add("knownWords"); need.add("learningWords"); }
       else if (o.op === "ctxAdd") need.add("contextLog");
+      else if (o.op === "ctxMerge") need.add("ctxDict");
+      else if (o.op === "senseAdd") { need.add("userDict"); need.add("meaningsDict"); }
     }
     if (!need.size) return { ok: false };
     const st = await chrome.storage.local.get([...need]);
@@ -83,6 +87,31 @@ function applyOps(ops) {
         if (arr.length > CTX_PER_WORD) arr.length = CTX_PER_WORD;
         const keys = Object.keys(cl);
         while (keys.length > CTX_MAX_WORDS) delete cl[keys.shift()];
+      } else if (o.op === "ctxMerge" && o.key && o.value) {
+        // cümle → { tr, w: {kelime: {a, k, l, n}}, t } ; yeni kelimeler eskilerle birleşir
+        const d = out.ctxDict || (out.ctxDict = st.ctxDict || {});
+        const key = String(o.key);
+        const prev = d[key];
+        if (!prev) {
+          const keys = Object.keys(d);
+          while (keys.length >= DICT_CAPS.ctxDict) delete d[keys.shift()];
+        }
+        d[key] = {
+          tr: o.value.tr || (prev && prev.tr) || "",
+          w: { ...((prev && prev.w) || {}), ...(o.value.w || {}) },
+          t: Date.now()
+        };
+      } else if (o.op === "senseAdd" && o.w && o.a) {
+        // kelime katmanı: ilk anlam temel karşılık olur, sonrakiler "diğer anlamlar"a eklenir
+        const ud = out.userDict || (out.userDict = st.userDict || {});
+        const md = out.meaningsDict || (out.meaningsDict = st.meaningsDict || {});
+        const w = String(o.w).toLowerCase(), a = String(o.a);
+        const al = a.toLowerCase();
+        if (!ud[w]) { ud[w] = a; continue; }
+        if (String(ud[w]).toLowerCase() === al) continue;
+        const list = Array.isArray(md[w]) ? md[w] : [];
+        if (list.some((x) => String(x).toLowerCase() === al)) continue;
+        md[w] = [...list, a].slice(-SENSES_MAX);
       }
     }
     if (known) { out.knownWords = [...known]; out.learningWords = [...learning]; }
@@ -270,12 +299,12 @@ async function getSettings() {
 }
 
 /* tek bir /api/generate çağrısı → { raw } | { down } | { timeout } | { error } | { cancelled } */
-function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, group } = {}) {
+function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, group, temperature = 0.1 } = {}) {
   if (Date.now() < ollamaDownUntil) return Promise.resolve({ down: true });
   return enqueue(async () => {
     if (Date.now() < ollamaDownUntil) return { down: true };
     const { url, model } = await getSettings();
-    const body = { model, prompt, stream: false, options: { temperature: 0.2 } };
+    const body = { model, prompt, stream: false, options: { temperature } };
     if (system) body.system = system;
     if (format) body.format = (schemaUnsupported && typeof format === "object") ? "json" : format;
     try {
@@ -329,6 +358,22 @@ function failOf(r) {
 
 const strArr = (n) => ({ type: "array", items: { type: "string" }, ...(n ? { maxItems: n } : {}) });
 const SCHEMA = {
+  analyze: {
+    type: "object",
+    properties: {
+      ceviri: { type: "string" },
+      kelimeler: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { kelime: { type: "string" }, kok: { type: "string" }, anlam: { type: "string" }, karsilik: { type: "string" } },
+          required: ["kelime", "kok", "anlam", "karsilik"]
+        }
+      },
+      aciklama: { type: "string" }
+    },
+    required: ["ceviri", "kelimeler", "aciklama"]
+  },
   word: {
     type: "object",
     properties: { anlam: { type: "string" }, diger: strArr(3), aciklama: { type: "string" } },
@@ -377,8 +422,15 @@ const unquote = (s) => String(s == null ? "" : s).trim().replace(/^["'“”]+|[
 /* ---- işlemler ---- */
 
 /* tek cümle çevirisi — doğrulamalı, gerekiyorsa kendi kendine tekrar dener */
-async function opSentence(sentence, { retries = 3, priority } = {}) {
-  const prompt =
+/* alan sözlüğü ipuçları: [{w,t}] → "Terimler: ..." satırı */
+function termLine(terms) {
+  const l = (Array.isArray(terms) ? terms : []).slice(0, 8)
+    .map((x) => `${String(x && x.w || "").slice(0, 40)} = ${String(x && x.t || "").slice(0, 60)}`).filter((x) => !x.startsWith(" ="));
+  return l.length ? `Terimler (çeviride bu karşılıkları kullan): ${l.join("; ")}\n` : "";
+}
+
+async function opSentence(sentence, { retries = 3, priority, terms } = {}) {
+  const prompt = termLine(terms) +
     `Aşağıdaki İngilizce cümleyi Türkçeye çevir.\n` +
     `Kurallar: TEK bir çeviri ver (teknik/doğal gibi ayrımlar yapma, alternatif sunma); ` +
     `akıcı ve doğal olsun; teknik terimleri gerekiyorsa aynen bırak; ` +
@@ -397,10 +449,10 @@ async function opSentence(sentence, { retries = 3, priority } = {}) {
 }
 
 /* cümle listesi tek istekte; sıra/sayı tutmazsa null */
-async function opSentenceBatch(sentences, { priority = PRI.interactive, whole } = {}) {
+async function opSentenceBatch(sentences, { priority = PRI.interactive, whole, terms } = {}) {
   const sents = Array.isArray(sentences) ? sentences.slice(0, 30) : [];
   if (!sents.length) return { error: "boş liste" };
-  const prompt =
+  const prompt = termLine(terms) +
     "Aşağıdaki İngilizce cümleleri Türkçeye çevir. Kurallar: her cümle için TEK, akıcı ve doğal bir çeviri; " +
     "açıklama ekleme; teknik terimleri gerekiyorsa aynen bırak. Girdi cümleleriyle BİREBİR AYNI SIRADA ve " +
     "aynı sayıda öğe içeren {\"ceviriler\": [\"çeviri1\", \"çeviri2\", ...]} JSON nesnesi döndür.\n\n" +
@@ -417,7 +469,7 @@ async function opSentenceBatch(sentences, { priority = PRI.interactive, whole } 
   // saçma görünen öğeleri tek tek, doğrulamalı yolla tazele
   for (let i = 0; i < arr.length; i++) {
     if (looksLikeMeta(arr[i], sents[i])) {
-      const one = await opSentence(sents[i], { retries: 2, priority });
+      const one = await opSentence(sents[i], { retries: 2, priority, terms });
       if (one.t) arr[i] = one.t;
     }
   }
@@ -550,7 +602,92 @@ function bumpDaily() {
   });
 }
 
+/* ---- cümle odaklı analiz: cümle çevirisi + her kelimenin O cümledeki anlamı (tek istek) ----
+   targets: [{w, c:[aday anlamlar]}] · terms: [{w, t}] alan sözlüğü ipuçları · focus: imlecin altındaki kelime.
+   Sonuç ctxDict[cümle]'ye birleşir; cümle çevirisi sentenceDict'e, anlamlar kelime katmanına (userDict/meaningsDict) gider. */
+const ANALYZE_EXAMPLE =
+  'Örnek → Cümle: "We sat on the river bank and watched the boats." Kelimeler: bank (adaylar: banka | nehir kıyısı), watched (adaylar: izlemek | saat)\n' +
+  '{"ceviri":"Nehir kıyısında oturup tekneleri izledik.","kelimeler":[{"kelime":"bank","kok":"bank","anlam":"nehir kıyısı",' +
+  '"karsilik":"Nehir kıyısında"},{"kelime":"watched","kok":"watch","anlam":"izlemek","karsilik":"izledik"}],' +
+  '"aciklama":"river ile birlikte geçtiği için bank burada para kurumu değil, nehir kenarı anlamında."}';
+
+/* modelin işaretlediği karşılık anlamla örtüşmüyorsa çeviride anlamın kökünü ara
+   (ör. ephemeral: anlam "geçici", karşılık yanlışlıkla "iş yüklerini" → "geçici") */
+function fixKarsilik(tr, a, k) {
+  const low = (x) => String(x || "").toLocaleLowerCase("tr");
+  const T = low(tr);
+  const roots = low(a).split(/[\s,;/()]+/).filter((x) => x.length >= 4).map((x) => x.slice(0, 4));
+  const ok = k && T.includes(low(k));
+  if (ok && (!roots.length || roots.some((r) => low(k).includes(r)))) return k;
+  const trWords = String(tr).match(/[\p{L}'’-]+/gu) || [];
+  for (const r of roots) {
+    const hit = trWords.find((w) => low(w).startsWith(r));
+    if (hit) return hit;
+  }
+  return ok ? k : "";
+}
+
+async function opAnalyze(sentence, targets, focus, terms, domainLabel, group) {
+  sentence = String(sentence || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  const list = (Array.isArray(targets) ? targets : [])
+    .map((x) => ({ w: String(x && x.w || "").toLowerCase().slice(0, 40),
+      c: (Array.isArray(x && x.c) ? x.c : []).map((v) => String(v).slice(0, 40)).filter(Boolean).slice(0, 4) }))
+    .filter((x) => x.w).slice(0, 12);
+  focus = String(focus || "").toLowerCase();
+  if (!sentence || !list.length) return { error: "boş istek" };
+
+  const prompt =
+    `Alan: ${domainLabel || "genel"}\n` +
+    `Cümle: "${sentence}"\n` +
+    termLine(terms) +
+    `Kelimeler:\n` + list.map((x) => `- ${x.w}` + (x.c.length ? ` (adaylar: ${x.c.join(" | ")})` : "")).join("\n") + "\n" +
+    `Görev:\n` +
+    `1) "ceviri": cümlenin doğal, akıcı Türkçe çevirisi.\n` +
+    `2) "kelimeler": listedeki HER kelime için bir öğe. "anlam": kelimenin BU cümledeki Türkçe anlamı (en fazla 4 kelime; ` +
+    `adaylardan uyan varsa onu aynen seç, hiçbiri uymuyorsa kendin yaz). "kok": kelimenin sözlük biçimi (mitigates → mitigate). ` +
+    `"karsilik": senin "ceviri" metninde bu kelimeye denk gelen kısım, metinde geçtiği gibi.\n` +
+    `3) "aciklama": "${focus || list[0].w}" kelimesinin bu cümlede neden bu anlama geldiğini anlatan 1 kısa Türkçe cümle.\n` +
+    `Teknik terimi gerekiyorsa İngilizce bırakabilirsin.\n` + ANALYZE_EXAMPLE;
+
+  const r = await ollamaGenerate(prompt, { system: TR_SYS, format: SCHEMA.analyze, timeoutMs: 60000, group, temperature: 0 });
+  if (r.raw === undefined) return failOf(r);
+  const o = parseJson(r.raw, "object");
+  const tr = o && unquote(o.ceviri);
+  if (!tr || looksLikeMeta(tr, sentence)) return { error: "geçersiz yanıt" };
+
+  const wanted = new Set(list.map((x) => x.w));
+  const words = {};
+  for (const it of (Array.isArray(o.kelimeler) ? o.kelimeler : [])) {
+    const w = String(it && it.kelime || "").toLowerCase().trim();
+    const a = unquote(it && it.anlam);
+    if (!wanted.has(w) || !a || a.length > 60 || looksLikeMeta(a, w)) continue;
+    const k = unquote(it.karsilik);
+    const l = String(it.kok || "").toLowerCase().trim();
+    words[w] = {
+      a,
+      k: fixKarsilik(tr, a, k),
+      l: /^[a-z][a-z'-]{1,39}$/.test(l) && l !== w ? l : ""
+    };
+  }
+  if (focus && words[focus] && o.aciklama) {
+    const n = unquote(o.aciklama);
+    if (n && !looksLikeMeta(n, sentence)) words[focus].n = n.slice(0, 300);
+  }
+  if (!Object.keys(words).length) return { error: "geçersiz yanıt" };
+
+  const ops = [
+    { op: "ctxMerge", key: sentence, value: { tr, w: words } },
+    { op: "dictSet", store: "sentenceDict", key: sentence, value: tr },
+    ...Object.entries(words).map(([w, v]) => ({ op: "senseAdd", w, a: v.a }))
+  ];
+  await applyOps(ops);
+  bumpDaily();
+  const st = await chrome.storage.local.get("ctxDict");
+  return { entry: (st.ctxDict || {})[sentence] || { tr, w: words } };
+}
+
 /* ---- mesaj yönlendirici ----
+   krh-analyze:        { sentence, targets:[{w,c}], focus, terms:[{w,t}], domainLabel } -> { entry:{tr, w:{kelime:{a,k,l,n}}} } | { down } | { cancelled } | { error }
    krh-translate:      { word, sentence, domainLabel } -> { t, other, note } | { down } | { cancelled } | { error }
    krh-sentence:       { sentence }                    -> { t } | ...
    krh-sentence-batch: { sentences, whole?, batch? }   -> { arr } | ...
@@ -567,9 +704,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "krh-translate":
         dropQueued(tabGroup);   // imleç yeni kelimede: aynı sekmenin bekleyen eski istekleri düşer
         return opWord(String(msg.word || ""), msg.sentence, msg.domainLabel, tabGroup);
-      case "krh-sentence": return opSentence(String(msg.sentence || ""));
+      case "krh-analyze":
+        dropQueued(tabGroup);   // imleç başka cümleye/kelimeye geçti: bekleyen eski istekler düşer
+        return opAnalyze(msg.sentence, msg.targets, msg.focus, msg.terms, msg.domainLabel, tabGroup);
+      case "krh-sentence": return opSentence(String(msg.sentence || ""), { terms: msg.terms });
       case "krh-sentence-batch":
-        return opSentenceBatch(msg.sentences, { whole: msg.whole, priority: msg.batch ? PRI.batch : PRI.interactive });
+        return opSentenceBatch(msg.sentences, { whole: msg.whole, terms: msg.terms, priority: msg.batch ? PRI.batch : PRI.interactive });
       case "krh-ollama":
         switch (msg.op) {
           case "ping": return opPing(msg.timeoutMs);

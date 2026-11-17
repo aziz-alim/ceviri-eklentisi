@@ -150,3 +150,8 @@
   border-color: #c792ea !important;
   color: #c792ea !important;
 }
+#krh-tip .krh-sent .krh-hl {
+  all: unset !important;
+  color: #ffd27a !important;
+  font-weight: 700 !important;
+}

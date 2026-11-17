@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Çeviri Eklentisi — Hover Çevirmen",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Herhangi bir web sayfasında kelimenin üzerine gel → anlamı baloncukta gör. Google Translate tarzı hover çeviri; tamamen local sözlük + opsiyonel Ollama. Okuma modu ve domain bazlı (DevOps vb.) terim sözlüğü dahil.",
   "permissions": [
     "sidePanel",

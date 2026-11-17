@@ -10,6 +10,8 @@ Google Translate tarzı hover çeviri — sağ tık, seçim, kopyala-yapıştır
    - **Alan (domain) seçimine göre bağlamsal anlam** — örn. DevOps seçiliyse `pipeline` "boru hattı" değil *"CI/CD hattı: kodun build→test→deploy zinciri"* olarak gösterilir.
    - Phrasal verb / ikili kalıplar (`start with`, `respond to`…) kelimenin yanında 💡 ile belirir.
    - Sözlükte olmayan kelime → **Ollama** (bilgisayarında çalışan local LLM) ile çevrilir ve kalıcı sözlüğe eklenir; bir sonraki hover'da anında gelir.
+   - **Cümle odaklı anlam (🎯):** kelimenin geçtiği cümle tek istekte çevrilir; cümledeki bilinmeyen kelimelerin *o cümledeki* anlamı da aynı cevapta gelir. Baloncukta cümlenin çevirisi, kelimenin karşılığı vurgulu görünür. Aynı cümledeki diğer kelimeler yeni istek olmadan anında açılır. Çok anlamlı kelimeler ("bark": havlamak / ağaç kabuğu) cümleye göre ayrılır.
+   - Alan sözlüğündeki terimler (postmortem, rollback…) LLM'e sorulmaz; çeviri istemlerine terim ipucu olarak eklenir.
 2. **Balondaki butonlar:** ✓ *Biliyorum* / 📖 *Öğreniyorum* — kelime durumu tüm ekranlarla senkron.
 3. **Okuma modu (yan panel):** "Sayfayı okuma moduna al" ile makaleyi temiz görünümde oku; kelimeye tıkla → detay çekmecesi, cümle çevirisi, bağlamsal açıklama.
 
