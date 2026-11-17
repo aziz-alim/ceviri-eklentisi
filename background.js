@@ -260,31 +260,52 @@ chrome.storage.onChanged.addListener((chg, area) => {
      kelime istekleri kuyruktan düşer ({cancelled:true}).
    - Zaman aşımı: AbortSignal.timeout. Zaman aşımı "Ollama kapalı" sayılmaz
      (model ilk yüklenirken yavaş olabilir); bağlantı hatası 60 sn "kapalı" önbelleğine girer.
-   - format: JSON şeması (Ollama ≥ 0.5). Eski sürüm şemayı reddederse "json" moduna düşülür. */
+   - format: JSON şeması (Ollama ≥ 0.5). Eski sürüm şemayı reddederse "json" moduna düşülür.
+   - Arka plan ön çevirisi (prefetch) en düşük öncelikte ve aynı anda en çok MAX_PREFETCH istekle
+     çalışır; böylece hover için her zaman boş bir yer kalır. Kullanıcı ön çevirisi bekleyen bir
+     cümleye gelirse istek öne alınır (promote). */
 const MAX_PARALLEL = 2;
-const PRI = { interactive: 0, batch: 1 };
+const MAX_PREFETCH = 1;
+const PRI = { interactive: 0, batch: 1, prefetch: 2 };
+let runningPrefetch = 0;
 const queue = [];
 let running = 0;
 let ollamaDownUntil = 0;
 let schemaUnsupported = false;
 
-function enqueue(task, { priority = PRI.interactive, group = null } = {}) {
+function insertByPriority(item) {
+  let i = queue.length;
+  while (i > 0 && queue[i - 1].priority > item.priority) i--;   // aynı öncelikte FIFO
+  queue.splice(i, 0, item);
+}
+function enqueue(task, { priority = PRI.interactive, group = null, key = null } = {}) {
   return new Promise((resolve) => {
-    const item = { task, resolve, priority, group };
-    let i = queue.length;
-    while (i > 0 && queue[i - 1].priority > priority) i--;   // aynı öncelikte FIFO
-    queue.splice(i, 0, item);
+    insertByPriority({ task, resolve, priority, group, key });
     pump();
   });
 }
 function pump() {
   while (running < MAX_PARALLEL && queue.length) {
-    const it = queue.shift();
+    const it = queue[0];
+    if (it.priority === PRI.prefetch && runningPrefetch >= MAX_PREFETCH) break;   // kuyruk sıralı: geri kalanı da prefetch
+    queue.shift();
     running++;
+    const pre = it.priority === PRI.prefetch;
+    if (pre) runningPrefetch++;
     Promise.resolve().then(it.task)
       .then(it.resolve, () => it.resolve({ error: "beklenmeyen hata" }))
-      .finally(() => { running--; pump(); });
+      .finally(() => { running--; if (pre) runningPrefetch--; pump(); });
   }
+}
+/* bekleyen arka plan isteğini etkileşimli önceliğe taşı */
+function promote(key) {
+  const i = queue.findIndex((q) => q.key === key);
+  if (i < 0) return false;
+  const [it] = queue.splice(i, 1);
+  it.priority = PRI.interactive;
+  insertByPriority(it);
+  pump();
+  return true;
 }
 function dropQueued(group) {
   for (let i = queue.length - 1; i >= 0; i--) {
@@ -299,7 +320,7 @@ async function getSettings() {
 }
 
 /* tek bir /api/generate çağrısı → { raw } | { down } | { timeout } | { error } | { cancelled } */
-function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, group, temperature = 0.1 } = {}) {
+function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, group, key, temperature = 0.1 } = {}) {
   if (Date.now() < ollamaDownUntil) return Promise.resolve({ down: true });
   return enqueue(async () => {
     if (Date.now() < ollamaDownUntil) return { down: true };
@@ -337,7 +358,7 @@ function ollamaGenerate(prompt, { system, format, timeoutMs = 45000, priority, g
       ollamaDownUntil = Date.now() + 60000;   // 1 dk boyunca hızlı "kapalı" dön
       return { down: true };
     }
-  }, { priority, group });
+  }, { priority, group, key });
 }
 
 /* ilk geçerli JSON nesnesi/dizisi: önce tam metin, sonra metin içinden ayıklama */
@@ -627,7 +648,7 @@ function fixKarsilik(tr, a, k) {
   return ok ? k : "";
 }
 
-async function opAnalyze(sentence, targets, focus, terms, domainLabel, group) {
+async function opAnalyze(sentence, targets, focus, terms, domainLabel, group, { prefetch = false } = {}) {
   sentence = String(sentence || "").replace(/\s+/g, " ").trim().slice(0, 300);
   const list = (Array.isArray(targets) ? targets : [])
     .map((x) => ({ w: String(x && x.w || "").toLowerCase().slice(0, 40),
@@ -649,7 +670,12 @@ async function opAnalyze(sentence, targets, focus, terms, domainLabel, group) {
     `3) "aciklama": "${focus || list[0].w}" kelimesinin bu cümlede neden bu anlama geldiğini anlatan 1 kısa Türkçe cümle.\n` +
     `Teknik terimi gerekiyorsa İngilizce bırakabilirsin.\n` + ANALYZE_EXAMPLE;
 
-  const r = await ollamaGenerate(prompt, { system: TR_SYS, format: SCHEMA.analyze, timeoutMs: 60000, group, temperature: 0 });
+  const r = await ollamaGenerate(prompt, {
+    system: TR_SYS, format: SCHEMA.analyze, group, temperature: 0,
+    timeoutMs: prefetch ? 180000 : 60000,          // kuyrukta beklerken öne alınabilir
+    priority: prefetch ? PRI.prefetch : PRI.interactive,
+    key: "ctx:" + sentence
+  });
   if (r.raw === undefined) return failOf(r);
   const o = parseJson(r.raw, "object");
   const tr = o && unquote(o.ceviri);
@@ -681,13 +707,14 @@ async function opAnalyze(sentence, targets, focus, terms, domainLabel, group) {
     ...Object.entries(words).map(([w, v]) => ({ op: "senseAdd", w, a: v.a }))
   ];
   await applyOps(ops);
-  bumpDaily();
+  if (!prefetch) bumpDaily();                        // günlük sayaç yalnız kullanıcının baktığı kelimeler
   const st = await chrome.storage.local.get("ctxDict");
   return { entry: (st.ctxDict || {})[sentence] || { tr, w: words } };
 }
 
 /* ---- mesaj yönlendirici ----
-   krh-analyze:        { sentence, targets:[{w,c}], focus, terms:[{w,t}], domainLabel } -> { entry:{tr, w:{kelime:{a,k,l,n}}} } | { down } | { cancelled } | { error }
+   krh-promote:        { sentence } -> { ok }   ·   krh-bg-cancel: {} -> { ok }
+   krh-analyze:        { prefetch?, sentence, targets:[{w,c}], focus, terms:[{w,t}], domainLabel } -> { entry:{tr, w:{kelime:{a,k,l,n}}} } | { down } | { cancelled } | { error }
    krh-translate:      { word, sentence, domainLabel } -> { t, other, note } | { down } | { cancelled } | { error }
    krh-sentence:       { sentence }                    -> { t } | ...
    krh-sentence-batch: { sentences, whole?, batch? }   -> { arr } | ...
@@ -705,8 +732,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         dropQueued(tabGroup);   // imleç yeni kelimede: aynı sekmenin bekleyen eski istekleri düşer
         return opWord(String(msg.word || ""), msg.sentence, msg.domainLabel, tabGroup);
       case "krh-analyze":
+        if (msg.prefetch) {
+          return opAnalyze(msg.sentence, msg.targets, msg.focus, msg.terms, msg.domainLabel,
+            "bg" + tabGroup.slice(5), { prefetch: true });
+        }
         dropQueued(tabGroup);   // imleç başka cümleye/kelimeye geçti: bekleyen eski istekler düşer
         return opAnalyze(msg.sentence, msg.targets, msg.focus, msg.terms, msg.domainLabel, tabGroup);
+      case "krh-promote":       // kullanıcı ön çevirisi bekleyen cümleye geldi
+        return { ok: promote("ctx:" + String(msg.sentence || "").replace(/\s+/g, " ").trim().slice(0, 300)) };
+      case "krh-bg-cancel":     // sekme gizlendi / ön çeviri kapatıldı
+        dropQueued("bg" + tabGroup.slice(5));
+        return { ok: true };
       case "krh-sentence": return opSentence(String(msg.sentence || ""), { terms: msg.terms });
       case "krh-sentence-batch":
         return opSentenceBatch(msg.sentences, { whole: msg.whole, terms: msg.terms, priority: msg.batch ? PRI.batch : PRI.interactive });

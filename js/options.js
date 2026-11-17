@@ -25,6 +25,7 @@ async function init() {
   $("#model").value = settings.model;
   $("#hoverEnabled").checked = settings.hoverEnabled !== false;
   $("#highlightEnabled").checked = settings.highlightEnabled !== false;
+  $("#autoTranslate").checked = settings.autoTranslate !== false;
   $("#defDomain").value = settings.domain || "devops";
   renderWordTable();
   renderStats();
@@ -37,6 +38,7 @@ async function init() {
   });
   $("#hoverEnabled").addEventListener("change", save);   // anahtar: tıklar tıklamaz kaydet
   $("#highlightEnabled").addEventListener("change", save);
+  $("#autoTranslate").addEventListener("change", save);
   $("#defDomain").addEventListener("change", save);
   $("#btnCleanup").addEventListener("click", runCleanup);
   $("#wordFilter").addEventListener("input", renderWordTable);
@@ -193,6 +195,7 @@ async function save() {
   settings.model = $("#model").value.trim() || "llama3.1";
   settings.hoverEnabled = $("#hoverEnabled").checked;
   settings.highlightEnabled = $("#highlightEnabled").checked;
+  settings.autoTranslate = $("#autoTranslate").checked;
   settings.domain = $("#defDomain").value || "devops";
   await chrome.storage.local.set({ settings });
   const s = $("#saved");

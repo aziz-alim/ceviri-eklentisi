@@ -61,12 +61,14 @@
         enabled = isEnabled();
         if (!enabled) hideTip(true);
         refreshHlState();
+        setupPrefetch();
       }
       if (chg.siteRules) {
         siteRules = chg.siteRules.newValue || {};
         enabled = isEnabled();
         if (!enabled) hideTip(true);
         refreshHlState();
+        setupPrefetch();
       }
       if (chg.siteDomains) siteDomains = chg.siteDomains.newValue || {};
       if (chg.customGlossary) customGlossary = chg.customGlossary.newValue || {};
@@ -92,6 +94,17 @@
     document.addEventListener("mouseup", onSelectEnd);          // sürükle-seç → çeviri
 
     refreshHlState();
+    setupPrefetch();
+    new MutationObserver((muts) => {
+      for (const m of muts) if (m.addedNodes.length) { scheduleBlockScan(1500); return; }
+    }).observe(document.body, { childList: true, subtree: true });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        if (bgPending.size) try { chrome.runtime.sendMessage({ type: "krh-bg-cancel" }, () => void chrome.runtime.lastError); } catch (e) {}
+      } else {
+        visibleBlocks.forEach((el) => enqueueBlock(el));
+      }
+    });
     if (HL_SUPPORTED) {
       // sonsuz kaydırma vb. yeni içerik geldiğinde renkleri tazele (debounce'lu)
       new MutationObserver((muts) => {
@@ -272,7 +285,23 @@
       if (tr) { phrase = { pair, tr }; break; }
     }
 
-    return { word, rect, sentence: sentenceAround(text, start, end), phrase };
+    return { word, rect, sentence: sentenceFor(node, start, end), phrase };
+  }
+
+  /* cümle, mümkünse bağlantı/kod gibi satır içi öğelerle bölünmemiş paragraf metninden alınır
+     (ön çeviri de aynı anahtarı üretir) */
+  function sentenceFor(node, start, end) {
+    const block = node.parentElement && node.parentElement.closest(BLOCK_SEL);
+    if (block) {
+      const full = block.textContent;
+      if (full.length <= 5000) {
+        let off = 0, n;
+        const tw = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+        while ((n = tw.nextNode()) && n !== node) off += n.data.length;
+        if (n === node) return sentenceAround(full, off + start, off + end);
+      }
+    }
+    return sentenceAround(node.data, start, end);
   }
 
   function sentenceAround(text, start, end) {
@@ -579,6 +608,7 @@
         !(!cw && ctxWasAsked(ctx.sentence, w) && !ctxPending.has(ctx.sentence));
       if (!gloss && !cw && ctxOk) requestAnalyze(ctx.sentence, w);   // cümle bir kez analiz edilir
       const ctxBusy = ctxOk && ctxIsPending(ctx.sentence);
+      if (ctxBusy) promoteIfQueued(ctx.sentence);
       if (gloss) {
         const domainMeaning = gloss[curDomain()] || gloss.devops || gloss.software ||
           Object.values(gloss).find((v) => typeof v === "string");
@@ -728,9 +758,10 @@
     return out;
   }
 
-  function requestAnalyze(sentence, focus) {
+  /* prefetch=true: arka plan ön çevirisi (focus yok, en düşük öncelik). Gönderildiyse true döner. */
+  function requestAnalyze(sentence, focus, { prefetch = false } = {}) {
     if (llmDown && Date.now() - llmDownAt > 60000) llmDown = false;
-    if (llmDown || ctxPending.has(sentence) || ctxWasAsked(sentence, focus)) return;
+    if (llmDown || ctxPending.has(sentence) || (focus && ctxWasAsked(sentence, focus))) return false;
     const have = (ctxDict[sentence] && ctxDict[sentence].w) || {};
     const targets = [], terms = [], seen = new Set();
     const consider = (raw, isFocus) => {
@@ -739,27 +770,33 @@
       seen.add(w);
       const g = glossOf(w);
       if (g && typeof g === "object") { terms.push({ w, t: shortGloss(g) }); if (!isFocus) return; }
-      if (!isFocus && (STOP.has(w) || have[w] || known.has(w))) return;
+      if (!isFocus && (STOP.has(w) || have[w] || known.has(w) || ctxWasAsked(sentence, w))) return;
       if (targets.length < 12) targets.push({ w, c: candidatesOf(w) });
     };
-    consider(focus, true);
+    if (focus) consider(focus, true);
     for (const m of sentence.match(HL_WORD) || []) consider(m, false);
-    if (!targets.length) return;
+    if (!targets.length) return false;
     ctxPending.set(sentence, new Set(targets.map((x) => x.w)));
+    if (prefetch) { bgPending.add(sentence); bgInflight++; bgSent++; }
+    const finish = () => {
+      ctxPending.delete(sentence);
+      if (prefetch) { bgPending.delete(sentence); bgInflight--; setTimeout(pumpBg, 0); }
+    };
     try {
       chrome.runtime.sendMessage({
-        type: "krh-analyze", sentence, focus, targets, terms,
+        type: "krh-analyze", sentence, focus: focus || "", targets, terms, prefetch,
         domainLabel: DOMAIN_LABELS[curDomain()] || "genel"
       }, (resp) => {
         const asked = ctxPending.get(sentence);
-        ctxPending.delete(sentence);
+        finish();
         if (chrome.runtime.lastError) return;
         if (!(resp && resp.cancelled) && !(resp && resp.down) && asked) {
           const a = ctxAsked.get(sentence) || new Set();
           asked.forEach((x) => a.add(x));
           ctxAsked.set(sentence, a);
         }
-        if (resp && resp.cancelled) {                // imleç başka cümleye geçti: tekrar sorulabilir
+        if (resp && resp.cancelled) {                // imleç başka cümleye geçti / sekme gizlendi: tekrar sorulabilir
+          if (prefetch) bgDone.delete(sentence);
           if (ctx && ctx.sentence === sentence) renderTip();
           return;
         }
@@ -775,10 +812,129 @@
         if (ctx && ctx.sentence === sentence) { renderTip(); placeTip(ctx.rect); }
       });
     } catch (e) {
-      ctxPending.delete(sentence);
+      finish();
       llmDown = true;
       llmDownAt = Date.now();
+      return false;
     }
+    return true;
+  }
+
+  /* ---- arka plan ön çevirisi: ekranda görünen paragrafların cümleleri sırayla analiz edilir ----
+     Sen bir kelimenin üzerine gelmeden önce cümlesi hazır olur, balon anında açılır.
+     Background'da en düşük öncelikte ve tek slotla çalışır; hover her zaman önce gelir. */
+  const BLOCK_SEL = "p, li, h1, h2, h3, h4, h5, h6, blockquote, dd, dt, td, th, figcaption, summary";
+  const PREFETCH_PAGE_MAX = 300;         // sayfa başına en fazla ön çeviri isteği
+  const BG_INFLIGHT = 2;                 // background'a aynı anda gönderilen (1 çalışır, 1 bekler)
+  const DWELL = 800;                     // paragraf en az bu kadar ekranda kalmalı (hızlı kaydırmada istek yok)
+  let io = null, observed = new WeakSet(), bgScanTimer = null;
+  const visibleBlocks = new Set();
+  const dwellTimers = new Map();
+  let bgQueue = [];                      // [{s, el}]
+  let bgInflight = 0, bgSent = 0;
+  const bgDone = new Set();              // kuyruğa alınmış/işlenmiş cümleler
+  const bgPending = new Set();           // background'da bekleyen ön çeviri cümleleri
+  const promoted = new Set();
+
+  function prefetchOn() {
+    return enabled && settings.autoTranslate !== false && !/^tr\b/i.test(document.documentElement.lang || "");
+  }
+
+  /* blok metnini, sentenceAround ile birebir aynı sınırlarla cümlelere böl (önbellek anahtarları eşleşsin) */
+  function sentencesOf(full) {
+    const out = [];
+    let st = 0;
+    for (let i = 0; i < full.length; i++) {
+      if (".!?…\n".includes(full[i])) { out.push(full.slice(st, i + 1)); st = i + 1; }
+    }
+    if (st < full.length) out.push(full.slice(st));
+    return out.map((x) => x.replace(/\s+/g, " ").trim().slice(0, 300)).filter(Boolean);
+  }
+  function looksEnglish(sn) {
+    const ws = sn.match(/[A-Za-zçğıöşüÇĞİÖŞÜ]+/g) || [];
+    if (ws.length < 3) return false;
+    const tr = ws.filter((w) => /[çğıöşüÇĞİÖŞÜ]/.test(w)).length;
+    return tr / ws.length < 0.15;
+  }
+
+  function setupPrefetch() {
+    if (!prefetchOn() || !("IntersectionObserver" in window)) { stopPrefetch(); return; }
+    if (!io) io = new IntersectionObserver(onIntersect, { rootMargin: "150px 0px" });
+    scanBlocks();
+  }
+  function stopPrefetch() {
+    if (io) { io.disconnect(); io = null; }
+    observed = new WeakSet();
+    visibleBlocks.clear();
+    dwellTimers.forEach((t) => clearTimeout(t));
+    dwellTimers.clear();
+    bgQueue = [];
+    if (bgPending.size) try { chrome.runtime.sendMessage({ type: "krh-bg-cancel" }, () => void chrome.runtime.lastError); } catch (e) {}
+  }
+  function scheduleBlockScan(ms) {
+    if (!io) return;
+    clearTimeout(bgScanTimer);
+    bgScanTimer = setTimeout(scanBlocks, ms);
+  }
+  function scanBlocks() {
+    if (!io) return;
+    let n = 0;
+    for (const el of document.querySelectorAll(BLOCK_SEL)) {
+      if (n >= 2000) break;
+      if (observed.has(el)) continue;
+      observed.add(el);
+      if (el.closest("#krh-tip, nav, footer, [contenteditable=''], [contenteditable='true']")) continue;
+      if (el.querySelector(BLOCK_SEL)) continue;            // yalnız en içteki bloklar
+      const len = el.textContent.length;
+      if (len < 20 || len > 5000) continue;
+      io.observe(el);
+      n++;
+    }
+  }
+  function onIntersect(entries) {
+    for (const en of entries) {
+      const el = en.target;
+      if (en.isIntersecting) {
+        visibleBlocks.add(el);
+        if (!dwellTimers.has(el)) {
+          dwellTimers.set(el, setTimeout(() => {
+            dwellTimers.delete(el);
+            if (visibleBlocks.has(el)) enqueueBlock(el);
+          }, DWELL));
+        }
+      } else {
+        visibleBlocks.delete(el);
+        clearTimeout(dwellTimers.get(el));
+        dwellTimers.delete(el);
+      }
+    }
+  }
+  function enqueueBlock(el) {
+    for (const sn of sentencesOf(el.textContent)) {
+      if (bgDone.has(sn) || ctxDict[sn] || !ctxEligible(sn) || !looksEnglish(sn)) continue;
+      bgDone.add(sn);
+      bgQueue.push({ s: sn, el });
+    }
+    pumpBg();
+  }
+  function pumpBg() {
+    if (llmDown && Date.now() - llmDownAt > 60000) llmDown = false;
+    if (llmDown) { setTimeout(pumpBg, 61000); return; }
+    while (bgInflight < BG_INFLIGHT && bgQueue.length && bgSent < PREFETCH_PAGE_MAX &&
+           !document.hidden && prefetchOn()) {
+      // önce hâlâ ekranda olan paragraflar; ekrandan çıkanlar sonra yeniden görünürse tekrar sıraya girer
+      let i = bgQueue.findIndex((q) => visibleBlocks.has(q.el));
+      if (i < 0) { bgQueue.forEach((q) => bgDone.delete(q.s)); bgQueue = []; break; }
+      const [it] = bgQueue.splice(i, 1);
+      if (ctxDict[it.s]) continue;
+      requestAnalyze(it.s, null, { prefetch: true });
+    }
+  }
+  /* kullanıcı ön çevirisi kuyrukta bekleyen bir cümleye geldi: background'da öne al */
+  function promoteIfQueued(sentence) {
+    if (!bgPending.has(sentence) || promoted.has(sentence)) return;
+    promoted.add(sentence);
+    try { chrome.runtime.sendMessage({ type: "krh-promote", sentence }, () => void chrome.runtime.lastError); } catch (e) {}
   }
 
   /* çeviri metnini yaz, kelimenin karşılığını kalın göster (innerHTML yok) */
