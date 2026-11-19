@@ -15,6 +15,7 @@ async function init() {
   siteDomains = st.siteDomains || {};
   $("#swHover").checked = settings.hoverEnabled !== false;
   $("#swHl").checked = settings.highlightEnabled !== false;
+  $("#swAuto").checked = settings.autoTranslate !== false;
 
   // aktif sekmenin sitesini bul — chrome:// gibi sayfalarda site satırı gizlenir
   try {
@@ -57,6 +58,10 @@ async function init() {
 
   $("#swHover").addEventListener("change", () => {
     settings.hoverEnabled = $("#swHover").checked;
+    chrome.storage.local.set({ settings });
+  });
+  $("#swAuto").addEventListener("change", () => {   // yalnız arka plan ön çevirisi; hover ve 📓 açık kalır
+    settings.autoTranslate = $("#swAuto").checked;
     chrome.storage.local.set({ settings });
   });
   $("#swHl").addEventListener("change", () => {

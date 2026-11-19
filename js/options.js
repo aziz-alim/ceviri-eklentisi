@@ -27,6 +27,8 @@ async function init() {
   $("#highlightEnabled").checked = settings.highlightEnabled !== false;
   $("#autoTranslate").checked = settings.autoTranslate !== false;
   $("#defDomain").value = settings.domain || "devops";
+  $("#obsidianVault").value = settings.obsidianVault || "";
+  $("#obsidianFolder").value = settings.obsidianFolder || "Kavramlar";
   renderWordTable();
   renderStats();
   renderQuiz();
@@ -197,6 +199,8 @@ async function save() {
   settings.highlightEnabled = $("#highlightEnabled").checked;
   settings.autoTranslate = $("#autoTranslate").checked;
   settings.domain = $("#defDomain").value || "devops";
+  settings.obsidianVault = $("#obsidianVault").value.trim();
+  settings.obsidianFolder = $("#obsidianFolder").value.trim().replace(/^\/+|\/+$/g, "") || "Kavramlar";
   await chrome.storage.local.set({ settings });
   const s = $("#saved");
   s.style.visibility = "visible";

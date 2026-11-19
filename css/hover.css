@@ -127,7 +127,8 @@
   color: #f5a623 !important;
 }
 /* gizli elemanlar: .krh-off her zaman kazanır (kaynak sırası en sonda) */
-#krh-tip .krh-off { display: none !important; }
+#krh-tip .krh-off,
+#krh-tip .krh-btns button.krh-off { display: none !important; }   /* buton kuralından özgül olmalı */
 
 /* ---- bilinen/öğrenilen kelime renklendirmesi (Custom Highlight API) ---- */
 ::highlight(kr-known) {

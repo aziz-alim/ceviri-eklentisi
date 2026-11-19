@@ -27,8 +27,21 @@ Google Translate tarzı hover çeviri — sağ tık, seçim, kopyala-yapıştır
 ## Aç / kapat ve alan seçimi
 
 - **Eklenti ikonuna tıkla** → hover çeviri anahtarı + alan (DevOps / Yazılım / Genel) seçici.
+- Aynı yerde **Otomatik sayfa çevirisi** anahtarı: görünen cümlelerin arka planda önceden çevrilmesini kapatır; hover balonu ve 📓 kavram kaydı açık kalır.
 - Kısayol: `Alt+Shift+K` (hover'ı hızlıca aç/kapat; kapalıyken ikonda ⏸ rozeti görünür).
 - ⚙️ Ayarlar sayfasından da hover anahtarı, Ollama adresi/modeli ve özel terimler yönetilir.
+
+## 📓 Obsidian kavram notları
+
+Balondaki **📓** düğmesi üzerine geldiğin kelimeyi ya da en fazla 6 kelimelik bir seçimi (örn. `CNI`, `Container Network Interface`) Obsidian'a kavram notu olarak kaydeder:
+
+- Ollama şu alanları doldurur: kısaltma, açılım, Türkçe karşılık, ne işe yaradığı, nerelerde kullanıldığı, ilişkili kavramlar, alan. Not `durum: doğrulanmadı` ile açılır, çünkü küçük modeller açılım uydurabiliyor.
+- Kavramın geçtiği cümle ve sayfa bağlantısı "Gördüğüm yerler" bölümüne yazılır.
+- Aynı kavrama tekrar basarsan yeni not açılmaz; yalnız "Gördüğüm yerler" bölümüne yeni bir satır eklenir.
+- Ollama kapalıysa not yine açılır, alanlar boş kalır.
+- Not `obsidian://new` bağlantısıyla açılır, Obsidian'a eklenti kurmak gerekmez. İlk seferde Chrome "Obsidian açılsın mı?" diye sorar.
+- ⚙️ Ayarlar → **Obsidian kavram notları**: vault adı (boşsa son açık vault) ve klasör (varsayılan `Kavramlar`).
+- Notlar `kavram` etiketi ve özellik alanlarıyla oluşturulur; Obsidian Bases ile tablo olarak listelenebilir.
 
 ## Ollama (opsiyonel, tamamen local)
 

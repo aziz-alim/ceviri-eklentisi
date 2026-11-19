@@ -36,7 +36,7 @@ function withStore(fn) {
   return p;
 }
 
-const DICT_STORES = ["userDict", "meaningsDict", "explainDict", "sentenceDict", "ctxDict"];
+const DICT_STORES = ["userDict", "meaningsDict", "explainDict", "sentenceDict", "ctxDict", "conceptDict"];
 const DICT_CAPS = { meaningsDict: 1500, explainDict: 1500, sentenceDict: 2000, ctxDict: 2000 };
 const SENSES_MAX = 5;   // kelime katmanında tutulan farklı anlam sayısı
 const CTX_PER_WORD = 5, CTX_MAX_WORDS = 1500;
@@ -379,6 +379,17 @@ function failOf(r) {
 
 const strArr = (n) => ({ type: "array", items: { type: "string" }, ...(n ? { maxItems: n } : {}) });
 const SCHEMA = {
+  concept: {
+    type: "object",
+    properties: {
+      kisaltma: { type: "string" }, acilim: { type: "string" }, turkce: { type: "string" },
+      ne_ise_yarar: { type: "string" },
+      nerelerde: { type: "array", items: { type: "string" } },
+      iliskili: { type: "array", items: { type: "string" } },
+      alan: { type: "array", items: { type: "string" } }
+    },
+    required: ["kisaltma", "acilim", "turkce", "ne_ise_yarar", "nerelerde", "iliskili", "alan"]
+  },
   analyze: {
     type: "object",
     properties: {
@@ -606,6 +617,100 @@ async function opPing(timeoutMs) {
   } catch (e) { return { ok: false }; }
 }
 
+/* ---- 📓 kavram notu → Obsidian ----
+   Ollama kavramın açılımını, Türkçesini, ne işe yaradığını ve kullanım yerlerini doldurur;
+   not obsidian://new ile açılır (Obsidian'a eklenti gerekmez). Aynı kavram daha önce
+   kaydedildiyse yeni not açılmaz, "Gördüğüm yerler" bölümüne bir satır eklenir (append). */
+function yamlStr(v) { return JSON.stringify(String(v == null ? "" : v)); }   // JSON dizgesi geçerli YAML'dır
+function yamlList(arr) {
+  const a = (Array.isArray(arr) ? arr : []).map((x) => String(x || "").trim()).filter(Boolean);
+  return a.length ? "\n" + a.map((x) => "  - " + yamlStr(x)).join("\n") : " []";
+}
+function conceptFileName(term) {
+  return String(term).replace(/[\\/:*?"<>|#^\[\]]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60) || "Kavram";
+}
+function sightingLine(day, { sentence, url, title }) {
+  let host = "";
+  try { host = new URL(url).hostname; } catch (e) {}
+  const label = String(title || host || "sayfa").replace(/[\[\]\n]/g, " ").slice(0, 80).trim();
+  const link = /^https?:/.test(url || "") ? `[${label}](${url})` : label;
+  const s = String(sentence || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  return `- ${day} · ${link}` + (s ? ` · "${s.replace(/"/g, "'")}"` : "");
+}
+function conceptMarkdown(term, info, day, src) {
+  const i = info || {};
+  const list = (a, empty) => {
+    const x = (Array.isArray(a) ? a : []).map((v) => String(v || "").trim()).filter(Boolean);
+    return x.length ? x.map((v) => "- " + v).join("\n") : empty;
+  };
+  return "---\n" +
+    "tags:\n  - kavram\n" +
+    "kisaltma: " + yamlStr(i.kisaltma) + "\n" +
+    "acilim: " + yamlStr(i.acilim) + "\n" +
+    "turkce: " + yamlStr(i.turkce) + "\n" +
+    "alan:" + yamlList(i.alan) + "\n" +
+    "durum: doğrulanmadı\n" +
+    "eklendi: " + day + "\n" +
+    "kaynak:" + yamlList(/^https?:/.test(src.url || "") ? [src.url] : []) + "\n" +
+    "---\n" +
+    "# " + term + "\n\n" +
+    "> [!warning] Ollama tarafından dolduruldu\n" +
+    "> Açılımı ve açıklamayı doğrula, sonra `durum` alanını `öğreniyorum` ya da `biliyorum` yap.\n\n" +
+    "## Ne işe yarar\n" + (String(i.ne_ise_yarar || "").trim() || "") + "\n\n" +
+    "## Nerelerde kullanılır\n" + list(i.nerelerde, "- ") + "\n\n" +
+    "## İlişkili\n" + list(i.iliskili, "- ") + "\n\n" +
+    "## Gördüğüm yerler\n" + sightingLine(day, src) + "\n";
+}
+function obsidianUri(params) {
+  return "obsidian://new?" + Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== "")
+    .map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+}
+async function opConcept(msg, tabId) {
+  const term = String(msg.term || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!term) return { error: "kavram boş" };
+  const st = await chrome.storage.local.get(["settings", "conceptDict"]);
+  const s = st.settings || {};
+  const vault = String(s.obsidianVault || "").trim();
+  const folder = String(s.obsidianFolder || "Kavramlar").trim().replace(/^\/+|\/+$/g, "");
+  const day = dayKey(new Date());
+  const src = { sentence: msg.sentence, url: msg.url, title: msg.title };
+  const key = term.toLowerCase();
+  const prev = (st.conceptDict || {})[key];
+  let uri, mode, file, llm = true;
+
+  if (prev) {                                  // zaten kayıtlı: yalnız görülen yeri ekle
+    file = prev;
+    mode = "append";
+    uri = obsidianUri({ vault, file, append: "true", content: sightingLine(day, src) });   // Obsidian ayırıcı satırı kendisi ekler
+  } else {
+    const r = await ollamaGenerate(
+      `Alan: ${msg.domainLabel || "genel"}.\nKavram: "${term}"\n` +
+      (src.sentence ? `Geçtiği cümle: "${String(src.sentence).slice(0, 300)}"\n` : "") +
+      "Bu teknik kavram için şu alanları Türkçe doldur ve YALNIZCA JSON nesnesi döndür:\n" +
+      "kisaltma: kavram bir kısaltmaysa kısaltma (örn. CNI), değilse boş;\n" +
+      "acilim: kısaltmanın İngilizce açık hali; emin değilsen BOŞ bırak, uydurma;\n" +
+      "turkce: Türkçe karşılığı (en fazla 5 kelime);\n" +
+      "ne_ise_yarar: 2-3 cümlelik Türkçe açıklama;\n" +
+      "nerelerde: nerelerde/hangi araçlarda kullanıldığı, 2-4 kısa madde;\n" +
+      "iliskili: ilişkili kavramlar, en fazla 4;\n" +
+      "alan: 1-2 alan adı (örn. Kubernetes, Networking, Linux).",
+      { system: "Sen DevOps ve yazılım terimlerini Türkçe açıklayan titiz bir asistansın. Bilmediğin bilgiyi uydurmazsın.",
+        format: SCHEMA.concept, timeoutMs: 90000 });
+    let info = null;
+    if (r.raw !== undefined) info = parseJson(r.raw, "object");
+    if (!info || typeof info !== "object") { info = {}; llm = false; }
+    file = folder ? folder + "/" + conceptFileName(term) : conceptFileName(term);
+    mode = "new";
+    uri = obsidianUri({ vault, file, content: conceptMarkdown(term, info, day, src) });
+    await applyOps([{ op: "dictSet", store: "conceptDict", key, value: file }]);
+  }
+  if (msg.dryRun) return { ok: true, mode, file, llm, uri };
+  if (tabId == null) return { error: "sekme yok" };
+  await chrome.tabs.update(tabId, { url: uri });   // dış protokol: sayfa değişmez, Obsidian açılır
+  return { ok: true, mode, file, llm };
+}
+
 /* ---- günlük istatistik + rozet sayacı ----
    dailyStats: { "2026-10-19": { translated: 12 } } — 90 gün saklanır, gün anahtarı yerel saat */
 function bumpDaily() {
@@ -743,6 +848,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "krh-bg-cancel":     // sekme gizlendi / ön çeviri kapatıldı
         dropQueued("bg" + tabGroup.slice(5));
         return { ok: true };
+      case "krh-concept": return opConcept(msg, sender.tab ? sender.tab.id : null);
       case "krh-sentence": return opSentence(String(msg.sentence || ""), { terms: msg.terms });
       case "krh-sentence-batch":
         return opSentenceBatch(msg.sentences, { whole: msg.whole, terms: msg.terms, priority: msg.batch ? PRI.batch : PRI.interactive });

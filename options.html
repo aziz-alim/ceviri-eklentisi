@@ -68,6 +68,13 @@
   <input id="model" placeholder="llama3.1">
   <p class="muted">Kurulum: <code>curl -fsSL https://ollama.com/install.sh | sh</code> → <code>ollama pull llama3.1</code> → <code>ollama serve</code>. Modeli hiç kurmadan sadece sözlük özelliklerini kullanabilirsin.</p>
 
+  <h2>📓 Obsidian kavram notları</h2>
+  <p class="muted">Balondaki 📓 düğmesi kelimeyi ya da kısa seçimi kavram notu olarak Obsidian'a kaydeder (açılım, Türkçesi, ne işe yaradığı, nerelerde kullanıldığı). Aynı kavrama tekrar basınca yalnız "Gördüğüm yerler" bölümüne satır eklenir.</p>
+  <label>Vault adı (boş bırakılırsa Obsidian'da son açık vault)</label>
+  <input id="obsidianVault" placeholder="Vault adı">
+  <label>Klasör (vault içinde)</label>
+  <input id="obsidianFolder" placeholder="Kavramlar">
+
   <h2>Alan (domain)</h2>
   <p class="muted">Alan seçimi artık <b>site bazlı</b>: eklenti ikonundaki popup'tan seçtiğin alan o siteye kaydedilir (örn. DevOps okuduğun sitede DevOps, diğer sitelerde genel çeviri). Buradan varsayılan alanı belirle:</p>
   <select id="defDomain" style="max-width:220px">

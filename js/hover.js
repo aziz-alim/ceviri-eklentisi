@@ -459,6 +459,7 @@
         '<button data-s="learning" title="📖 Öğreniyorum">📖</button>' +
         '<button data-a="retr" title="🔄 Yeniden çevir (Ollama)">🔄</button>' +
         '<button data-a="speak" title="🔊 Telaffuz">🔊</button>' +
+        '<button data-a="concept" title="📓 Kavram olarak Obsidian\'a kaydet">📓</button>' +
       "</div>";
     (document.body || document.documentElement).appendChild(tip);
 
@@ -483,6 +484,10 @@
     tip.querySelector('[data-a="speak"]').addEventListener("click", (ev) => {
       ev.stopPropagation();
       speakWord();
+    });
+    tip.querySelector('[data-a="concept"]').addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      saveConcept();
     });
     return tip;
   }
@@ -521,6 +526,56 @@
       u.volume = 1;
       speechSynthesis.speak(u);
     } catch (e) {}
+  }
+
+  /* 📓 kavram: balondaki kelimeyi ya da kısa seçimi (en fazla 6 kelime) Obsidian'a not olarak kaydet.
+     Ollama açılımı/Türkçesini/açıklamayı doldurur; not background'da obsidian:// ile açılır. */
+  const conceptBusy = new Set();
+  function conceptTerm() {
+    if (!ctx) return "";
+    const t = (ctx.sel ? ctx.text : ctx.word || "").replace(/\s+/g, " ").trim();
+    if (!t || t.length > 80 || t.split(" ").length > 6) return "";
+    return t;
+  }
+  function setConceptBtn(icon, title) {
+    const b = tip && tip.querySelector('[data-a="concept"]');
+    if (!b) return;
+    b.textContent = icon;
+    b.title = title || "📓 Kavram olarak Obsidian'a kaydet";
+  }
+  function refreshConceptBtn() {
+    const b = tip && tip.querySelector('[data-a="concept"]');
+    if (!b) return;
+    const term = conceptTerm();
+    b.classList.toggle("krh-off", !term);
+    if (conceptBusy.has(term.toLowerCase())) setConceptBtn("⏳", "Kavram notu hazırlanıyor…");
+    else setConceptBtn("📓");
+  }
+  function saveConcept() {
+    const term = conceptTerm();
+    if (!term) return;
+    const key = term.toLowerCase();
+    if (conceptBusy.has(key)) return;
+    conceptBusy.add(key);
+    setConceptBtn("⏳", "Kavram notu hazırlanıyor… (Ollama)");
+    const sentence = ctx.sel ? "" : (ctx.sentence || "");
+    try {
+      chrome.runtime.sendMessage({
+        type: "krh-concept", term, sentence,
+        url: location.href, title: document.title,
+        domainLabel: DOMAIN_LABELS[curDomain()] || "genel"
+      }, (resp) => {
+        conceptBusy.delete(key);
+        if (chrome.runtime.lastError || !resp || resp.error) {
+          setConceptBtn("⚠️", "Kaydedilemedi: " + ((resp && resp.error) || (chrome.runtime.lastError && chrome.runtime.lastError.message) || "yanıt yok"));
+          return;
+        }
+        if (conceptTerm().toLowerCase() !== key) return;   // balon başka kelimeye geçti
+        setConceptBtn("✅", resp.mode === "append"
+          ? "Zaten vardı: \"Gördüğüm yerler\" bölümüne eklendi (" + resp.file + ")"
+          : "Obsidian'da açıldı: " + resp.file + (resp.llm ? "" : " (Ollama yok, alanlar boş)"));
+      });
+    } catch (e) { conceptBusy.delete(key); setConceptBtn("⚠️", "Kaydedilemedi"); }
   }
 
   /* 🔄 baştan çevirt: seçim modunda cümleleri, kelime modunda kelime kaydını sil ve yeniden sor */
@@ -571,6 +626,7 @@
     note.classList.add("krh-off");
     note.textContent = "";
     sent.classList.add("krh-off");
+    refreshConceptBtn();
 
     /* ---- seçim modu: sürüklenen metnin tek çevirisi ---- */
     if (ctx.sel) {
